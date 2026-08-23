@@ -1,17 +1,17 @@
 -- InfinityGold public development test loader.
--- Build: magic-loot-0.1.0-compat.2+wi.2026.004.public-test.1
--- Private source ref: 475c4d3776edf066769a2a997852ed64e2200fdd
--- Public payload ref: 7e05eecf67dd9a7a13d65692f2af8ee71c3e2122
+-- Build: magic-loot-0.1.0-compat.3+wi.2026.005.public-test.1
+-- Private source ref: 40ba99c51607b2b9ea64488fc40f3c60948dc1bc
+-- Public payload ref: 1229a7a876d2ee19014d46c2cae21e3248cd20ae
 -- This unsigned loader has no licensing and must never be treated as production.
 
 if not game:IsLoaded() then
     game.Loaded:Wait()
 end
 
-local BUILD_ID = 'magic-loot-0.1.0-compat.2+wi.2026.004.public-test.1'
+local BUILD_ID = 'magic-loot-0.1.0-compat.3+wi.2026.005.public-test.1'
 local EXPIRES_AT = '2026-09-23T00:00:00Z'
 local EXPIRES_UNIX = 1790121600
-local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Launcher/7e05eecf67dd9a7a13d65692f2af8ee71c3e2122/releases/game.magic-loot/0.1.0-compat.2/'
+local BASE = 'https://raw.githubusercontent.com/InfinityControlR/Launcher/1229a7a876d2ee19014d46c2cae21e3248cd20ae/releases/game.magic-loot/0.1.0-compat.3/'
 
 local bannerGui
 
