@@ -1,0 +1,43 @@
+{
+  "artifacts": [
+    {
+      "kind": "game-adapter",
+      "path": "games/magicloot.lua",
+      "sha256": "4f3e8986a651e63d3068379487bb606bea17107e65a0f3f46cb3974f65751d22",
+      "size_bytes": 256104,
+      "source_path": "games/magic-loot/src/compat/magicloot.lua"
+    },
+    {
+      "kind": "module",
+      "path": "games/magicloot_common.lua",
+      "sha256": "4c866d07067562c868c7ec20e2e4a03180a990e499b458904312793fcb3db623",
+      "size_bytes": 15244,
+      "source_path": "games/magic-loot/src/compat/magicloot_common.lua"
+    },
+    {
+      "kind": "module",
+      "path": "games/magicloot_locomotion.lua",
+      "sha256": "5253ee84955b72213b98d30a6a0495a2fcc144649323604cc3d770f4f4083735",
+      "size_bytes": 54047,
+      "source_path": "games/magic-loot/src/compat/magicloot_locomotion.lua"
+    },
+    {
+      "kind": "module",
+      "path": "ui/InfinityUI.lua",
+      "sha256": "6619d1715cc6f5994752b514163a7608cced3b6dff6d438f13a8d9af73e84590",
+      "size_bytes": 68199,
+      "source_path": "games/magic-loot/src/compat/ui/InfinityUI.lua"
+    }
+  ],
+  "build_id": "magic-loot-0.1.0-compat.2+wi.2026.004.public-test.1",
+  "builder": "distribution/build/infinitygold/build_public_test.py@1.0.0",
+  "component_version": "0.1.0-compat.2",
+  "created_at": "2026-08-23T18:00:00Z",
+  "expires_at": "2026-09-23T00:00:00Z",
+  "licensed_delivery": false,
+  "product_id": "game.magic-loot",
+  "production": false,
+  "schema": 1,
+  "source_ref": "475c4d3776edf066769a2a997852ed64e2200fdd",
+  "status": "public-development-test"
+}
