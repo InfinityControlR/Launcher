@@ -1,0 +1,6450 @@
+-- InfinityGold for Magic Loot — original automation suite.
+--
+-- Entry point: the loader calls this chunk with
+--   (locomotionFactory, Library, Common)
+-- locomotionFactory may be nil (module failed to load); InfinityGold keeps
+-- working without the external Walking/Broom extension in that case.
+--
+-- Design rules honoured here:
+--   * Walking never teleports and never touches WalkSpeed/JumpPower.
+--   * Only the external Walking module may request a character reset.
+--   * Every game-integration surface is fail-open: a missing remote or
+--     module disables its feature with a status message instead of erroring.
+
+local BRAND = "InfinityGold"
+local MAX_FARM_STAGE = 32
+local PLACE_ID = 133188236593503
+local CREATOR_ID = 118455659
+local DISCORD_INVITE = "" -- set to an invite URL to show the invite button
+
+return function(locomotionFactory, Library, Common)
+    local bannerGui
+
+    local function banner(content)
+        pcall(function()
+            if player == nil then return end
+            local playerGui = player:FindFirstChildOfClass("PlayerGui")
+            if playerGui == nil then return end
+            if bannerGui == nil or bannerGui.Parent == nil then
+                bannerGui = Instance.new("ScreenGui")
+                bannerGui.Name = "InfinityGoldStatus"
+                bannerGui.ResetOnSpawn = false
+                bannerGui.DisplayOrder = 1000000
+                bannerGui.IgnoreGuiInset = true
+                bannerGui.Parent = playerGui
+
+                local label = Instance.new("TextLabel")
+                label.Name = "Status"
+                label.AnchorPoint = Vector2.new(0.5, 1)
+                label.Position = UDim2.new(0.5, 0, 1, -24)
+                label.Size = UDim2.new(0.92, 0, 0, 30)
+                label.BackgroundColor3 = Color3.fromRGB(13, 13, 18)
+                label.BackgroundTransparency = 0.15
+                label.TextColor3 = Color3.fromRGB(245, 197, 66)
+                label.Font = Enum.Font.GothamBold
+                label.TextSize = 13
+                label.TextWrapped = true
+                label.Parent = bannerGui
+
+                local rounding = Instance.new("UICorner")
+                rounding.CornerRadius = UDim.new(0, 8)
+                rounding.Parent = label
+            end
+            bannerGui.Status.Text = "[InfinityGold] " .. tostring(content)
+        end)
+    end
+
+    local function earlyNotify(content)
+        banner(content)
+        pcall(function()
+            Library:Notify({
+                Title = BRAND,
+                Content = content,
+                Duration = 6,
+            })
+        end)
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = BRAND,
+                Text = content,
+                Duration = 6,
+            })
+        end)
+    end
+
+    if game.PlaceId ~= PLACE_ID and game.CreatorId ~= CREATOR_ID then
+        earlyNotify("Unsupported game (PlaceId " .. tostring(game.PlaceId) .. ")")
+        return
+    end
+
+    if type(Library) ~= "table" or type(Library.CreateWindow) ~= "function" then
+        warn("[" .. BRAND .. "] interface library unavailable")
+        return
+    end
+
+    local Players = game:GetService("Players")
+    local CollectionService = game:GetService("CollectionService")
+    local ReplicatedFirst = game:GetService("ReplicatedFirst")
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+    local RunService = game:GetService("RunService")
+    local TeleportService = game:GetService("TeleportService")
+    local HttpService = game:GetService("HttpService")
+    local UserInputService = game:GetService("UserInputService")
+
+    local player = Players.LocalPlayer
+    if player == nil then
+        Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+        player = Players.LocalPlayer
+    end
+
+    local sessionEnvironment = nil
+    pcall(function()
+        if type(getgenv) == "function" then
+            sessionEnvironment = getgenv()
+            local previousUnload = sessionEnvironment.__INFINITYGOLD_UNLOAD
+            if type(previousUnload) == "function" then pcall(previousUnload, "reload") end
+        end
+    end)
+    pcall(function()
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if playerGui == nil then return end
+        for _, name in ipairs({
+            "InfinityGoldToggle",
+            "InfinityGoldLoaderToggle",
+            "InfinityGoldEmergency",
+        }) do
+            for _, child in ipairs(playerGui:GetChildren()) do
+                if child.Name == name then child:Destroy() end
+            end
+        end
+    end)
+
+    local sessionAlive = true
+    local unloaded = false
+    local floatingGui
+    local emergencyGui
+    local unloadSession
+    local startedAt = os.clock()
+    local executorName = type(identifyexecutor) == "function"
+        and tostring(identifyexecutor())
+        or "unknown"
+    local alchemyInvokeLease = { pending = false, generation = 0, startedAt = nil }
+    if sessionEnvironment ~= nil then
+        local existingLease = sessionEnvironment.__INFINITYGOLD_ALCHEMY_INVOKE
+        if type(existingLease) == "table" then
+            alchemyInvokeLease = existingLease
+            alchemyInvokeLease.pending = existingLease.pending == true
+            alchemyInvokeLease.generation = tonumber(existingLease.generation) or 0
+            alchemyInvokeLease.startedAt = tonumber(existingLease.startedAt)
+            alchemyInvokeLease.inventoryEpoch = math.max(
+                0,
+                math.floor(tonumber(existingLease.inventoryEpoch) or 0)
+            )
+            alchemyInvokeLease.inventoryStageActive =
+                existingLease.inventoryStageActive == true
+            if alchemyInvokeLease.pending and alchemyInvokeLease.startedAt == nil then
+                alchemyInvokeLease.startedAt = os.clock()
+            end
+        else
+            alchemyInvokeLease.inventoryEpoch = 0
+            alchemyInvokeLease.inventoryStageActive = false
+            sessionEnvironment.__INFINITYGOLD_ALCHEMY_INVOKE = alchemyInvokeLease
+        end
+    end
+    alchemyInvokeLease.inventoryEpoch = math.max(
+        0,
+        math.floor(tonumber(alchemyInvokeLease.inventoryEpoch) or 0)
+    )
+    alchemyInvokeLease.inventoryStageActive =
+        alchemyInvokeLease.inventoryStageActive == true
+    -- Migrate a request handed off by the previous physical-Alchemy build.
+    -- Restore only while the same root is still beside that old destination;
+    -- never overwrite a newer Broom/respawn position. New Alchemy requests are
+    -- remote and never publish a physical travel lease.
+    local inheritedAlchemyTravel = type(alchemyInvokeLease.travel) == "table"
+        and alchemyInvokeLease.travel
+        or nil
+    if inheritedAlchemyTravel ~= nil then
+        pcall(function()
+            local root = inheritedAlchemyTravel.root
+            local destination = inheritedAlchemyTravel.destination
+            if root ~= nil
+                and root.Parent ~= nil
+                and inheritedAlchemyTravel.home ~= nil
+                and destination ~= nil
+                and (root.Position - destination.Position).Magnitude <= 12
+            then
+                root.CFrame = inheritedAlchemyTravel.home
+            end
+        end)
+    end
+    alchemyInvokeLease.travel = nil
+    alchemyInvokeLease.holdUntil = nil
+
+    -- Common helpers: loader-supplied module with a minimal local fallback so
+    -- a missing download only degrades sorting, never the whole script.
+    if type(Common) ~= "table" then
+        Common = {
+            isEventDrop = function(gold)
+                return type(gold) == "number" and gold == 0
+            end,
+            sortDrops = function(entries)
+                local copy = {}
+                for index = 1, #entries do copy[index] = entries[index] end
+                table.sort(copy, function(left, right)
+                    return (left.gold or 0) > (right.gold or 0)
+                end)
+                return copy
+            end,
+            gateDrop = function(entry, options)
+                options = type(options) == "table" and options or {}
+                if not (entry.hasPrimaryPart and entry.landed and entry.inRange) then
+                    return false
+                end
+                if entry.isEvent == true then return true end
+                if math.floor(tonumber(entry.gold) or 0)
+                    < (tonumber(options.minValue) or 0)
+                then
+                    return false
+                end
+                if options.filterItems == true then
+                    local itemId = tonumber(entry.itemId)
+                    return type(options.itemIds) == "table"
+                        and itemId ~= nil
+                        and options.itemIds[math.floor(itemId)] == true
+                end
+                return true
+            end,
+            farmStageTarget = function(cleared, selected, specific)
+                if specific then return math.floor(tonumber(selected) or 1) end
+                return math.max((tonumber(cleared) or 0) + 1, math.floor(tonumber(selected) or 1))
+            end,
+            dragonWorldEventId = function(value)
+                local eventId = tonumber(value)
+                if eventId == nil then return nil end
+                eventId = math.floor(eventId)
+                return (eventId == 3 or eventId == 4) and eventId or nil
+            end,
+            worldEventTransition = function(
+                previousPhase,
+                activeId,
+                completedId,
+                currentId,
+                combatValue,
+                enabled
+            )
+                if enabled ~= true then return "idle", nil, nil, false end
+                local dragonId = tonumber(currentId)
+                if dragonId ~= nil then dragonId = math.floor(dragonId) end
+                dragonId = (dragonId == 3 or dragonId == 4) and dragonId or nil
+                local phase = tostring(previousPhase or "idle")
+                if phase == "cooldown" then
+                    if dragonId ~= nil and dragonId == tonumber(completedId) then
+                        return "cooldown", nil, completedId, false
+                    end
+                    phase, completedId = "idle", nil
+                end
+                if (tonumber(combatValue) or 0) > 0 then
+                    return "combat", dragonId or tonumber(activeId), nil, false
+                end
+                if phase == "combat" then
+                    local finishedId = tonumber(activeId) or dragonId
+                    return "cooldown", nil, finishedId, true
+                end
+                if dragonId ~= nil then return "seeking", dragonId, nil, false end
+                return "idle", nil, nil, false
+            end,
+            parseIdSelection = function(values)
+                local ids = {}
+                if type(values) == "table" then
+                    for key, value in pairs(values) do
+                        local numericKeyLookup = type(key) == "number" and value == true
+                        local candidate = numericKeyLookup and key
+                            or (type(key) == "number" and value or key)
+                        local selected = numericKeyLookup
+                            or (type(key) == "number" and value ~= false)
+                            or value == true
+                        local id = selected and (tonumber(candidate)
+                            or tonumber(string.match(tostring(candidate), "^#?(%d+)")))
+                        if id ~= nil and id > 0 then ids[math.floor(id)] = true end
+                    end
+                end
+                return ids
+            end,
+        }
+    end
+
+    local function notify(content, duration)
+        pcall(function()
+            Library:Notify({
+                Title = BRAND,
+                Content = tostring(content),
+                Duration = duration or 4,
+            })
+        end)
+    end
+
+    notify("starting • building dashboard...", 3)
+
+    -- Options ----------------------------------------------------------------
+
+    local cfg = {
+        -- Farm
+        AutoFarm = false,
+        AutoFarmSpecific = false,
+        AutoWorldEvent = false,
+        FarmStage = 1,
+        FarmMode = "Ground",
+        FarmHeight = 20,
+        OrbitRadius = 25,
+        OrbitSpeed = 1.5,
+        RunningDistance = 12,
+        EnterDelay = 0,
+        AttackRange = 120,
+        AutoReturnFull = true,
+        ReturnDelay = 0,
+        -- Combat
+        AutoAttack = true,
+        AutoClick = false,
+        ClickRate = 10,
+        -- Loot
+        AutoPickup = false,
+        PickupRange = 150,
+        PickupMinValue = 0,
+        PickupFilterItems = false,
+        PickupItems = {},
+        AutoSell = false,
+        AutoSellSpecific = false,
+        SellItems = {},
+        -- Progress
+        AutoRebirth = false,
+        RebirthLimit = 41,
+        AutoTrain = false,
+        TrainGround = "Best available",
+        -- Broom (installed by the locomotion module)
+        AutoBroom = false,
+        BroomStage = "4",
+        BroomReturnDelay = 5,
+        -- Alchemy
+        AutoBrew = false,
+        BrewRecipe = "Best craftable",
+        AutoDrinkPotion = false,
+        DrinkPotions = {},
+        AutoPickupPotion = true,
+        -- Rewards
+        AutoClaimIndex = false,
+        AutoClaimOnline = false,
+        AutoClaimEvent = false,
+        -- Gear
+        AutoBuyBest = false,
+        AutoEquipBest = false,
+        AutoBuyWand = false,
+        AutoEquipWand = false,
+        AutoEquipSelectedWand = false,
+        SelectedWand = "Select a wand",
+        AutoBuyArmor = false,
+        AutoEquipArmor = false,
+        -- Utility
+        AntiAfk = true,
+    }
+
+    local function parsePickupMinimumValue(value)
+        local numeric = tonumber(value)
+        if numeric == nil
+            or numeric ~= numeric
+            or numeric == math.huge
+            or numeric == -math.huge
+        then
+            return nil
+        end
+        return math.max(0, math.floor(numeric))
+    end
+
+    local configReady = false
+
+    local registry = {}
+
+    local function bind(name, element)
+        registry[name] = element
+        return element
+    end
+
+    -- Game network -----------------------------------------------------------
+
+    local net = {
+        utils = nil,
+        clientUtils = nil,
+        network = nil,
+        messages = nil,
+        status = "resolving",
+    }
+
+    local function isUtilsRegistry(value)
+        local valueType = type(value)
+        return valueType == "function"
+            or valueType == "table"
+            or valueType == "userdata"
+    end
+
+    local function requireUtilsSystem(container)
+        local function load()
+            local allSide = container:WaitForChild("AllSideCode", 8)
+            if allSide == nil then return nil end
+            local module = allSide:WaitForChild("UtilsSystem", 8)
+            if module == nil then return nil end
+            return require(module)
+        end
+
+        local ok, utils = pcall(load)
+        if (not ok or not isUtilsRegistry(utils))
+            and type(getthreadidentity) == "function"
+            and type(setthreadidentity) == "function"
+        then
+            local elevatedOk, elevatedUtils = pcall(function()
+                local identity = getthreadidentity()
+                setthreadidentity(2)
+                local loadOk, result = pcall(load)
+                setthreadidentity(identity)
+                if not loadOk then error(result) end
+                return result
+            end)
+            if elevatedOk then
+                ok, utils = true, elevatedUtils
+            end
+        end
+        if ok and isUtilsRegistry(utils) then return utils end
+        return nil
+    end
+
+    local function readUtilsEntry(utils, name)
+        if not isUtilsRegistry(utils) then return nil end
+
+        local function readEntry()
+            local utilsType = type(utils)
+            if utilsType == "function" then
+                return utils(name)
+            end
+
+            local direct = utils[name]
+            if direct ~= nil then return direct end
+
+            -- Some builds expose a callable table/userdata rather than a
+            -- plain lookup table.  Calling it matches UtilsSystem's original
+            -- registry contract while retaining compatibility with tables.
+            if utilsType == "userdata" then
+                return utils(name)
+            end
+            local metatable = getmetatable(utils)
+            if type(metatable) == "table" and type(metatable.__call) == "function" then
+                return utils(name)
+            end
+            return nil
+        end
+
+        local ok, candidate = pcall(readEntry)
+        if (not ok or candidate == nil)
+            and type(getthreadidentity) == "function"
+            and type(setthreadidentity) == "function"
+        then
+            local elevatedOk, elevatedCandidate = pcall(function()
+                local identity = getthreadidentity()
+                setthreadidentity(2)
+                local readOk, result = pcall(readEntry)
+                setthreadidentity(identity)
+                if not readOk then error(result) end
+                return result
+            end)
+            if elevatedOk then
+                ok, candidate = true, elevatedCandidate
+            end
+        end
+        if ok then return candidate end
+        return nil
+    end
+
+    local function resolveClientUtils()
+        if net.clientUtils ~= nil then return net.clientUtils end
+        -- The original Magic Loot runtime exposes PlayerData/GetData here.
+        local utils = requireUtilsSystem(ReplicatedFirst)
+        if utils ~= nil then net.clientUtils = utils end
+        return net.clientUtils
+    end
+
+    local function resolveNet()
+        if net.network ~= nil and net.messages ~= nil then
+            return net.network
+        end
+        -- NetWork can appear a little before NetMsg while the client is
+        -- loading. Keep retrying the message registry instead of caching a
+        -- permanent half-resolved state.
+        local utils = net.utils or resolveClientUtils()
+        local network = net.network or readUtilsEntry(utils, "NetWork")
+        if network == nil then
+            -- Keep a compatibility fallback for game builds that mirror only
+            -- the networking facade into ReplicatedStorage.
+            utils = requireUtilsSystem(ReplicatedStorage)
+            network = readUtilsEntry(utils, "NetWork")
+        end
+        if not isUtilsRegistry(utils) then
+            net.status = "UtilsSystem unavailable"
+            return nil
+        end
+        if type(network) ~= "table" and type(network) ~= "userdata" then
+            net.status = "NetWork unavailable"
+            return nil
+        end
+        net.utils = utils
+        net.network = network
+        -- The action->remote map may live on the facade itself depending on
+        -- the game build; try the known shapes before giving up.
+        local messages = readUtilsEntry(utils, "NetMsg")
+        if messages == nil then
+            local embeddedOk, embedded = pcall(function()
+                return network.NetMsg
+            end)
+            if embeddedOk then messages = embedded end
+        end
+        if messages == nil then
+            messages = readUtilsEntry(utils, "Net")
+        end
+        net.messages = messages
+        net.status = messages ~= nil and "ready" or "NetMsg unavailable"
+        return network
+    end
+
+    local function remoteFor(action)
+        local network = resolveNet()
+        if network == nil or net.messages == nil then
+            net.lastMissedAction = action
+            return nil
+        end
+        local ok, remote = pcall(function()
+            return net.messages[action]
+        end)
+        -- NetMsg entries are opaque descriptors consumed by the NetWork
+        -- facade. The observed live network call ultimately receives the
+        -- string "训练点屏"; NetMsg itself may expose strings, Instances or
+        -- tables depending on the build.
+        -- The original client only rejects a missing entry and forwards the
+        -- descriptor unchanged.
+        if ok and remote ~= nil then
+            return remote
+        end
+        net.lastMissedAction = action
+        return nil
+    end
+
+    local function sendAction(action, payload)
+        local network = resolveNet()
+        if network == nil then return false, net.status end
+        local remote = remoteFor(action)
+        if remote == nil then return false, action .. " remote unavailable" end
+        local methodOk, fireServer = pcall(function()
+            return network.FireServer
+        end)
+        if not methodOk or type(fireServer) ~= "function" then
+            return false, "NetWork.FireServer unavailable"
+        end
+        local ok, err
+        if payload == nil then
+            ok, err = pcall(fireServer, remote)
+        else
+            ok, err = pcall(fireServer, remote, payload)
+        end
+        if not ok then return false, tostring(err) end
+        return true
+    end
+
+    local function invokeAction(action, payload, beforeInvoke)
+        local network = resolveNet()
+        if network == nil then return false, nil, net.status, false end
+        local remote = remoteFor(action)
+        if remote == nil then
+            return false, nil, action .. " remote unavailable", false
+        end
+        local methodOk, invokeServer = pcall(function()
+            return network.InvokeServer
+        end)
+        if not methodOk or type(invokeServer) ~= "function" then
+            return false, nil, "NetWork.InvokeServer unavailable", false
+        end
+        if type(beforeInvoke) == "function" then
+            local guardOk, allowed, guardError = pcall(beforeInvoke)
+            if not guardOk then return false, nil, tostring(allowed), false end
+            if allowed ~= true then
+                return false, nil, guardError or "request cancelled", false
+            end
+        end
+        local ok, result
+        if payload == nil then
+            ok, result = pcall(invokeServer, remote)
+        else
+            ok, result = pcall(invokeServer, remote, payload)
+        end
+        if not ok then return false, nil, tostring(result), true end
+        return true, result, nil, true
+    end
+
+    -- Event quests expose their transport names directly instead of through
+    -- the stable English NetMsg aliases used by the rest of the hub. The live
+    -- one-shot probe confirmed the physical RemoteEvent/RemoteFunction path;
+    -- retain the NetWork facade only as a compatibility fallback.
+    local function sendLiteralAction(action, payload)
+        if type(action) ~= "string" or action == "" then
+            return false, "literal action unavailable"
+        end
+        local direct = nil
+        pcall(function()
+            local msg = ReplicatedStorage:FindFirstChild("Msg")
+            if msg == nil then return nil end
+            local folder = msg:FindFirstChild("RemoteEvent")
+            if folder == nil then return nil end
+            local candidate = folder:FindFirstChild("NetWorkRemoteEvent")
+            if candidate ~= nil and candidate:IsA("RemoteEvent") then
+                direct = candidate
+            end
+        end)
+        if direct ~= nil then
+            local ok, err
+            if payload == nil then
+                ok, err = pcall(function() direct:FireServer(action) end)
+            else
+                ok, err = pcall(function() direct:FireServer(action, payload) end)
+            end
+            if not ok then return false, tostring(err) end
+            return true
+        end
+
+        local network = resolveNet()
+        if network == nil then return false, net.status end
+        local methodOk, fireServer = pcall(function()
+            return network.FireServer
+        end)
+        if not methodOk or type(fireServer) ~= "function" then
+            return false, "NetWork.FireServer unavailable"
+        end
+        local ok, err
+        if payload == nil then
+            ok, err = pcall(fireServer, action)
+        else
+            ok, err = pcall(fireServer, action, payload)
+        end
+        if not ok then return false, tostring(err) end
+        return true
+    end
+
+    local function invokeLiteralAction(action, payload)
+        if type(action) ~= "string" or action == "" then
+            return false, nil, "literal action unavailable"
+        end
+        local direct = nil
+        pcall(function()
+            local msg = ReplicatedStorage:FindFirstChild("Msg")
+            if msg == nil then return nil end
+            local folder = msg:FindFirstChild("RemoteFunction")
+            if folder == nil then return nil end
+            local candidate = folder:FindFirstChild("NetWorkRemoteFunction")
+            if candidate ~= nil and candidate:IsA("RemoteFunction") then
+                direct = candidate
+            end
+        end)
+        if direct ~= nil then
+            local ok, result
+            if payload == nil then
+                ok, result = pcall(function() return direct:InvokeServer(action) end)
+            else
+                ok, result = pcall(function()
+                    return direct:InvokeServer(action, payload)
+                end)
+            end
+            if not ok then return false, nil, tostring(result) end
+            return true, result
+        end
+
+        local network = resolveNet()
+        if network == nil then return false, nil, net.status end
+        local methodOk, invokeServer = pcall(function()
+            return network.InvokeServer
+        end)
+        if not methodOk or type(invokeServer) ~= "function" then
+            return false, nil, "NetWork.InvokeServer unavailable"
+        end
+        local ok, result
+        if payload == nil then
+            ok, result = pcall(invokeServer, action)
+        else
+            ok, result = pcall(invokeServer, action, payload)
+        end
+        if not ok then return false, nil, tostring(result) end
+        return true, result
+    end
+
+    local function fireBindableAction(action, ...)
+        local network = resolveNet()
+        if network == nil then return false, net.status end
+        local remote = remoteFor(action)
+        if remote == nil then return false, action .. " bindable unavailable" end
+        local methodOk, fireBindable = pcall(function()
+            return network.FireBindable
+        end)
+        if not methodOk or type(fireBindable) ~= "function" then
+            return false, "NetWork.FireBindable unavailable"
+        end
+        local ok, err = pcall(fireBindable, remote, ...)
+        if not ok then return false, tostring(err) end
+        return true
+    end
+
+    -- Player data ------------------------------------------------------------
+
+    local function playerNumber(name)
+        local value = player:FindFirstChild(name)
+        if value == nil then return nil end
+        local ok, number = pcall(function() return tonumber(value.Value) end)
+        if ok then return number end
+        return nil
+    end
+
+    local getData = nil
+
+    local runtimeModules = {}
+
+    local function resolveRuntimeModule(name, refresh)
+        if not refresh and runtimeModules[name] ~= nil then
+            return runtimeModules[name]
+        end
+        local utils = resolveClientUtils()
+        if utils == nil then return runtimeModules[name] end
+
+        local candidate = readUtilsEntry(utils, name)
+        if candidate == nil then return runtimeModules[name] end
+
+        if typeof(candidate) == "Instance" then
+            local ok
+            ok, candidate = pcall(require, candidate)
+            if not ok then return runtimeModules[name] end
+        end
+        if type(candidate) ~= "table" then return runtimeModules[name] end
+
+        runtimeModules[name] = candidate
+        return candidate
+    end
+
+    local function resolveGetData(refresh)
+        -- UtilsSystem is populated asynchronously on some clients. Cache only
+        -- a successful resolution so an early probe cannot disable every
+        -- GetData-backed feature for the rest of the session. Catalog scans may
+        -- explicitly refresh this reference when a game patch swaps the facade.
+        if getData ~= nil and not refresh then return getData end
+        getData = resolveRuntimeModule("GetData", refresh) or getData
+        return getData
+    end
+
+    local function playerBag()
+        local playerData = resolveRuntimeModule("PlayerData")
+        if playerData == nil then
+            return nil, "PlayerData unavailable"
+        end
+        if type(playerData.GetPlrDataByKey) ~= "function" then
+            return nil, "GetPlrDataByKey unavailable"
+        end
+        local ok, bag = pcall(playerData.GetPlrDataByKey, player, "Bag")
+        if ok and type(bag) == "table" then return bag end
+        if not ok then return nil, "inventory read failed: " .. tostring(bag) end
+        return nil, "Bag data unavailable"
+    end
+
+    local function configByName(name)
+        -- Query both live facades on every catalog scan. A patch can replace a
+        -- registry entry or populate one facade before the other; selecting the
+        -- richest normalized result prevents a stale/empty table from hiding
+        -- newly released items.
+        local best = nil
+        local bestCount = -1
+        local function consider(result)
+            if type(result) ~= "table" then return end
+            local count = #Common.catalogEntries(result)
+            if count > bestCount then
+                best = result
+                bestCount = count
+            end
+        end
+
+        local cfgFind = resolveRuntimeModule("CfgFind", true)
+        if cfgFind ~= nil and type(cfgFind.GetCfgByName) == "function" then
+            local ok, result = pcall(cfgFind.GetCfgByName, name)
+            if ok then consider(result) end
+        end
+
+        local data = resolveGetData(true)
+        if data ~= nil and type(data.GetCfgByName) == "function" then
+            local ok, result = pcall(data.GetCfgByName, name)
+            if ok then consider(result) end
+        end
+        return best
+    end
+
+    local function translatedConfigName(raw, id, fallbackPrefix)
+        local name = type(raw) == "table"
+            and (raw.ZhName
+                or raw.Name
+                or raw.name
+                or raw.DisplayName
+                or raw.displayName)
+            or nil
+        if name ~= nil then
+            local translation = resolveRuntimeModule("TranslationHelper")
+            if translation ~= nil
+                and type(translation.TranslateByKey) == "function"
+            then
+                local ok, value = pcall(translation.TranslateByKey, name)
+                if ok and type(value) == "string" and value ~= "" then
+                    name = value
+                end
+            end
+        end
+        if type(name) ~= "string" or name == "" then
+            name = tostring(fallbackPrefix or "Item")
+        end
+        return name
+    end
+
+    local function catalogByName(name, itemType)
+        return Common.catalogEntries(configByName(name), itemType)
+    end
+
+    local function catalogDropdownValues(name, fallbackPrefix, firstValue, cleanVisible)
+        local values = {}
+        if firstValue ~= nil then table.insert(values, firstValue) end
+        for _, entry in ipairs(catalogByName(name)) do
+            local text = translatedConfigName(
+                entry.raw,
+                entry.id,
+                fallbackPrefix
+            )
+            if cleanVisible == true then
+                text = Common.catalogDisplayName(text, fallbackPrefix, entry.id)
+            end
+            table.insert(values, {
+                Value = tostring(entry.id),
+                Text = text,
+            })
+        end
+        return values
+    end
+
+    local onlineClaimTelemetry = {
+        available = 0,
+        attempts = 0,
+        claimed = 0,
+        lastError = nil,
+        status = "waiting",
+    }
+
+    local function claimableOnlineAwardIds()
+        local playerData = resolveRuntimeModule("PlayerData")
+        if playerData == nil or type(playerData.GetPlrDataByKey) ~= "function" then
+            return nil, "PlayerData unavailable"
+        end
+
+        local onlineOk, onlineBox = pcall(
+            playerData.GetPlrDataByKey,
+            player,
+            "OnlineBox"
+        )
+        if not onlineOk then
+            return nil, "OnlineBox read failed: " .. tostring(onlineBox)
+        end
+        if type(onlineBox) ~= "table" then
+            return nil, "OnlineBox unavailable"
+        end
+
+        local cfgFind = resolveRuntimeModule("CfgFind")
+        if cfgFind == nil
+            or type(cfgFind.GetOnlineAwardList) ~= "function"
+            or type(cfgFind.IsOnlineTierClaimable) ~= "function"
+        then
+            return nil, "online reward config unavailable"
+        end
+
+        local listOk, awardList = pcall(cfgFind.GetOnlineAwardList)
+        if not listOk or type(awardList) ~= "table" then
+            return nil, "online reward list unavailable"
+        end
+
+        local ids = {}
+        for _, award in ipairs(awardList) do
+            if type(award) == "table" then
+                local claimOk, claimable = pcall(
+                    cfgFind.IsOnlineTierClaimable,
+                    onlineBox,
+                    award
+                )
+                local id = math.floor(tonumber(award.id) or 0)
+                if claimOk and claimable and id > 0 then
+                    table.insert(ids, id)
+                end
+            end
+        end
+        return ids
+    end
+
+    local function claimOnlineAwards()
+        local ids, scanError = claimableOnlineAwardIds()
+        if ids == nil then
+            onlineClaimTelemetry.available = 0
+            onlineClaimTelemetry.lastError = scanError
+            onlineClaimTelemetry.status = scanError or "waiting"
+            return 0, scanError
+        end
+
+        onlineClaimTelemetry.available = #ids
+        onlineClaimTelemetry.lastError = nil
+        onlineClaimTelemetry.status = #ids > 0 and "claiming" or "waiting"
+
+        local claimed = 0
+        for _, awardId in ipairs(ids) do
+            if not sessionAlive or not cfg.AutoClaimOnline then break end
+            onlineClaimTelemetry.attempts = onlineClaimTelemetry.attempts + 1
+            local ok, _, err = invokeAction("CLAIM_ONLINE_AWARD", awardId)
+            if ok then
+                claimed = claimed + 1
+                onlineClaimTelemetry.claimed = onlineClaimTelemetry.claimed + 1
+            else
+                onlineClaimTelemetry.lastError = err
+            end
+            task.wait(0.35)
+        end
+
+        onlineClaimTelemetry.status = claimed > 0 and "claimed" or "waiting"
+        return claimed, onlineClaimTelemetry.lastError
+    end
+
+    local eventClaims = {}
+    do
+        local refreshAction = "活动界面已打开"
+        local submitAction = "活动任务提交"
+        local telemetry = {
+            available = 0,
+            attempts = 0,
+            claimed = 0,
+            scanned = 0,
+            stateGroups = 0,
+            configRows = 0,
+            lastError = nil,
+            status = "waiting",
+        }
+        local attemptedAt = {}
+
+        local function questNeed(value)
+            local valueType = type(value)
+            if valueType == "number" or valueType == "string" then
+                local direct = tonumber(value)
+                if direct ~= nil then return direct end
+            end
+            if type(value) ~= "table" then return nil end
+            for _, item in pairs(value) do
+                local number = tonumber(item)
+                if number ~= nil then return number end
+            end
+            return nil
+        end
+
+        local function sourcesFrom(objects)
+            local sources = {
+                stateByTag = {},
+                requirements = {},
+                derivedByTag = {},
+                scanned = 0,
+                stateGroups = 0,
+                configRows = 0,
+            }
+            if type(objects) ~= "table" then return sources end
+
+            for _, object in ipairs(objects) do
+                sources.scanned += 1
+                if type(object) == "table" then
+                    local accepted = rawget(object, "Accepted")
+                    local progress = rawget(object, "Progress")
+                    local completed = rawget(object, "Completed")
+                    if type(accepted) == "table"
+                        and type(progress) == "table"
+                        and type(completed) == "table"
+                    then
+                        sources.stateGroups += 1
+                        for key, value in pairs(accepted) do
+                            local tag = type(value) == "string" and value
+                                or (type(key) == "string" and value and key or nil)
+                            if type(tag) == "string" and tag ~= "" then
+                                sources.stateByTag[tag] = object
+                            end
+                        end
+                    end
+
+                    local cfgRow = rawget(object, "cfg")
+                    local row = type(cfgRow) == "table" and cfgRow or object
+                    local tag = rawget(row, "onlyTag")
+                    local need = questNeed(rawget(row, "need"))
+                    if type(tag) == "string"
+                        and tag ~= ""
+                        and rawget(row, "ResetType") ~= nil
+                        and need ~= nil
+                    then
+                        sources.requirements[tag] = need
+                        sources.configRows += 1
+                    end
+
+                    local derivedTag = rawget(object, "onlyTag")
+                    if type(derivedTag) == "string"
+                        and derivedTag ~= ""
+                        and type(rawget(object, "canClaim")) == "boolean"
+                        and rawget(object, "claimed") ~= nil
+                    then
+                        sources.derivedByTag[derivedTag] = object
+                    end
+                end
+            end
+            return sources
+        end
+
+        local function stateClaimed(state, tag)
+            local completed = type(state) == "table"
+                and rawget(state, "Completed") or nil
+            if type(completed) ~= "table" then return false end
+            local value = rawget(completed, tag)
+            return value ~= nil and value ~= false and value ~= 0
+        end
+
+        local function claimableFrom(sources)
+            local candidates = {}
+            if type(sources) ~= "table" then return candidates end
+
+            for tag, state in pairs(sources.stateByTag or {}) do
+                local derived = (sources.derivedByTag or {})[tag]
+                local claimed = stateClaimed(state, tag)
+                local claimable = false
+                if type(derived) == "table" then
+                    claimable = rawget(derived, "canClaim") == true
+                        and rawget(derived, "claimed") ~= true
+                        and not claimed
+                else
+                    local progressTable = rawget(state, "Progress")
+                    local progress = type(progressTable) == "table"
+                        and tonumber(rawget(progressTable, tag)) or nil
+                    local need = tonumber((sources.requirements or {})[tag])
+                    claimable = not claimed
+                        and progress ~= nil
+                        and need ~= nil
+                        and progress >= need
+                end
+                if claimable then table.insert(candidates, tag) end
+            end
+
+            for tag, derived in pairs(sources.derivedByTag or {}) do
+                if sources.stateByTag[tag] == nil
+                    and rawget(derived, "canClaim") == true
+                    and rawget(derived, "claimed") ~= true
+                then
+                    table.insert(candidates, tag)
+                end
+            end
+            table.sort(candidates)
+            return candidates
+        end
+
+        local function claimableTags()
+            if type(getgc) ~= "function" then
+                return nil, "getgc unavailable"
+            end
+            local ok, objects = pcall(getgc, true)
+            if not ok or type(objects) ~= "table" then
+                return nil, "event state scan failed"
+            end
+            local sources = sourcesFrom(objects)
+            telemetry.scanned = sources.scanned
+            telemetry.stateGroups = sources.stateGroups
+            telemetry.configRows = sources.configRows
+            return claimableFrom(sources)
+        end
+
+        function eventClaims.claim()
+            if not sessionAlive or not cfg.AutoClaimEvent then return 0 end
+            local refreshed, refreshError = sendLiteralAction(refreshAction)
+            if not refreshed then
+                telemetry.lastError = refreshError
+                telemetry.status = refreshError or "refresh unavailable"
+                return 0, refreshError
+            end
+            task.wait(0.1)
+            if not sessionAlive or not cfg.AutoClaimEvent then return 0 end
+
+            local tags, scanError = claimableTags()
+            if tags == nil then
+                telemetry.available = 0
+                telemetry.lastError = scanError
+                telemetry.status = scanError or "waiting"
+                return 0, scanError
+            end
+            telemetry.available = #tags
+            telemetry.lastError = nil
+            telemetry.status = #tags > 0 and "claiming" or "waiting"
+
+            local claimed = 0
+            for _, tag in ipairs(tags) do
+                if not sessionAlive or not cfg.AutoClaimEvent then break end
+                local now = os.clock()
+                local lastAttempt = attemptedAt[tag]
+                if lastAttempt == nil or now - lastAttempt >= 5 then
+                    attemptedAt[tag] = now
+                    telemetry.attempts += 1
+                    local ok, _, err = invokeLiteralAction(submitAction, tag)
+                    if ok then
+                        claimed += 1
+                        telemetry.claimed += 1
+                    else
+                        telemetry.lastError = err
+                    end
+                    task.wait(0.25)
+                end
+            end
+            telemetry.status = claimed > 0 and "claimed" or "waiting"
+            return claimed, telemetry.lastError
+        end
+
+        eventClaims.telemetry = telemetry
+        eventClaims.sourcesFrom = sourcesFrom
+        eventClaims.claimableFrom = claimableFrom
+    end
+
+    local indexViewModule = nil
+
+    local function resolveIndexView()
+        if indexViewModule ~= nil then return indexViewModule end
+        local ok, moduleScript = pcall(function()
+            return ReplicatedStorage
+                :WaitForChild("ClientSideCode")
+                :WaitForChild("GuiScripts")
+                :WaitForChild("ModuleScript")
+                :WaitForChild("Index")
+                :WaitForChild("IndexView")
+        end)
+        if not ok or moduleScript == nil then return nil end
+
+        local previousIdentity = nil
+        if type(getthreadidentity) == "function" then
+            pcall(function() previousIdentity = getthreadidentity() end)
+        end
+        if type(setthreadidentity) == "function" then
+            pcall(setthreadidentity, 2)
+        end
+        local requireOk, result = pcall(require, moduleScript)
+        if previousIdentity ~= nil and type(setthreadidentity) == "function" then
+            pcall(setthreadidentity, previousIdentity)
+        end
+        if requireOk and type(result) == "table" then
+            indexViewModule = result
+            return result
+        end
+        return nil
+    end
+
+    local function claimIndexRewards()
+        local indexData = resolveRuntimeModule("Index")
+        local indexView = resolveIndexView()
+        if indexData == nil
+            or indexView == nil
+            or type(indexView.buildAllTabSnapshots) ~= "function"
+        then
+            return 0, "IndexView snapshot API unavailable"
+        end
+
+        local ok, snapshots = pcall(
+            indexView.buildAllTabSnapshots,
+            indexData
+        )
+        if not ok or type(snapshots) ~= "table" then
+            return 0, "index snapshot failed"
+        end
+
+        local claimed = 0
+        for tag, snapshot in pairs(snapshots) do
+            if not sessionAlive or not cfg.AutoClaimIndex then break end
+            if type(snapshot) == "table"
+                and snapshot.canClaim == true
+                and snapshot.targetProgress ~= nil
+            then
+                local sent = invokeAction("INDEX_CLAIM_REWARD", {
+                    tag = tag,
+                    progress = snapshot.targetProgress,
+                })
+                if sent then claimed += 1 end
+                task.wait(0.3)
+            end
+        end
+        return claimed
+    end
+
+    local function isProtectedAlchemyMaterial(itemId)
+        local data = resolveGetData()
+        if data == nil
+            or type(data.Alchemy) ~= "table"
+            or type(data.Alchemy.IsMarkedRecipeMaterial) ~= "function"
+        then
+            return false
+        end
+        local ok, marked = pcall(data.Alchemy.IsMarkedRecipeMaterial, player, itemId)
+        return ok and marked == true
+    end
+
+    local sellTelemetry = {
+        status = "waiting",
+        challenge = nil,
+        brewInProgress = nil,
+        authorization = nil,
+        attempts = 0,
+        requests = 0,
+        requestedItems = 0,
+        lastCount = 0,
+        lastError = nil,
+    }
+
+    local function autoSellEnabled()
+        return cfg.AutoSell == true or cfg.AutoSellSpecific == true
+    end
+
+    local function automaticSellSelection()
+        if cfg.AutoSell == true then return nil end
+        return Common.parseIdSelection(cfg.SellItems)
+    end
+
+    local function sellAllMaterials(selectedIds, beforeSend)
+        local bag, bagError = playerBag()
+        if bag == nil then return false, 0, bagError or "inventory unavailable" end
+        local ok, onlyIds = pcall(
+            Common.sellOnlyIds,
+            bag,
+            selectedIds,
+            isProtectedAlchemyMaterial
+        )
+        if not ok or type(onlyIds) ~= "table" then
+            return false, 0, "inventory scan failed"
+        end
+        if #onlyIds == 0 then return false, 0, "nothing to sell" end
+
+        -- invokeAction runs this optional guard only after resolving NetWork
+        -- and NetMsg, immediately adjacent to InvokeServer. Sell All Now omits
+        -- it intentionally and remains a manual override.
+        local sent, _, err = invokeAction(
+            "SELL_MATERIAL",
+            { onlyIDList = onlyIds },
+            beforeSend
+        )
+        return sent, #onlyIds, err
+    end
+
+    local function playerGold()
+        local direct = playerNumber("Gold")
+        if direct ~= nil then return direct end
+        local data = resolveGetData()
+        if data ~= nil and type(data.GetPlrDataByKey) == "function" then
+            local ok, value = pcall(data.GetPlrDataByKey, "Gold")
+            if ok then return tonumber(value) end
+        end
+        return nil
+    end
+
+    -- The original Magic Loot client does not expose the bag limit through a
+    -- guessed LimitBagMax value. It asks GetData for item/count id 5 and then
+    -- compares that result with LocalPlayer.LimitBagUsed.
+    local BAG_CAPACITY_ITEM_ID = 5
+    local bagCapacityNames = { "LimitBagMax", "LimitBagCapacity", "LimitBagCount" }
+    local bagTelemetry = {
+        used = nil,
+        capacity = nil,
+        source = "waiting",
+        known = false,
+        full = false,
+        checkedAt = 0,
+    }
+
+    local function bagCapacity()
+        local data = resolveGetData()
+        if data ~= nil and type(data.GetItemCountByID) == "function" then
+            local ok, value = pcall(
+                data.GetItemCountByID,
+                player,
+                BAG_CAPACITY_ITEM_ID
+            )
+            value = ok and tonumber(value) or nil
+            if value ~= nil and value > 0 then
+                return value, "GetItemCountByID(5)"
+            end
+        end
+
+        -- Compatibility fallbacks for builds that mirror the limit directly
+        -- on the player. They are deliberately secondary to the proven game
+        -- contract above.
+        for _, name in ipairs(bagCapacityNames) do
+            local value = playerNumber(name)
+            if value ~= nil and value > 0 then return value, name end
+        end
+        if data ~= nil and type(data.GetPlrDataByKey) == "function" then
+            for _, key in ipairs({ "LimitBagMax", "LimitBagCapacity" }) do
+                local ok, value = pcall(data.GetPlrDataByKey, player, key)
+                if ok and tonumber(value) ~= nil and tonumber(value) > 0 then
+                    return tonumber(value), "GetPlrDataByKey(" .. key .. ")"
+                end
+            end
+        end
+        return nil, "unavailable"
+    end
+
+    local function bagFull()
+        local used = playerNumber("LimitBagUsed")
+        if used ~= nil then used = math.floor(used) end
+        local capacity, source = bagCapacity()
+        bagTelemetry.used = used
+        bagTelemetry.capacity = capacity
+        bagTelemetry.source = source
+        bagTelemetry.known = used ~= nil and capacity ~= nil and capacity > 0
+        bagTelemetry.full = bagTelemetry.known and used >= capacity or false
+        bagTelemetry.checkedAt = os.clock()
+        if used == nil or capacity == nil or capacity <= 0 then
+            return false, false, used, capacity, source
+        end
+        return used >= capacity, true, used, capacity, source
+    end
+
+    -- Stages -----------------------------------------------------------------
+
+    local stagePartCache = {}
+
+    local function stageModel(stage)
+        local scenes = workspace:FindFirstChild("场景")
+        if scenes == nil then return nil end
+        return scenes:FindFirstChild(tostring(stage))
+    end
+
+    local function stagePart(stage)
+        local cached = stagePartCache[stage]
+        if cached ~= nil and cached.Parent ~= nil then
+            return cached
+        end
+        stagePartCache[stage] = nil
+        local model = stageModel(stage)
+        if model == nil then return nil end
+        local ok, part = pcall(function()
+            return model:FindFirstChild("战斗区域", true)
+        end)
+        if ok and part ~= nil and part:IsA("BasePart") then
+            stagePartCache[stage] = part
+            return part
+        end
+        return nil
+    end
+
+    local function groundPoint(part)
+        return part.Position
+            - Vector3.new(0, part.Size.Y * 0.5, 0)
+            + Vector3.new(0, 3, 0)
+    end
+
+    local function isOverFootprint(part, point)
+        local localPoint = part.CFrame:PointToObjectSpace(point)
+        return math.abs(localPoint.X) <= part.Size.X * 0.5
+            and math.abs(localPoint.Y) <= part.Size.Y * 0.5
+            and math.abs(localPoint.Z) <= part.Size.Z * 0.5
+    end
+
+    -- Character --------------------------------------------------------------
+
+    local function characterParts()
+        local character = player.Character
+        if character == nil then return nil end
+        local root = character:FindFirstChild("HumanoidRootPart")
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if root == nil or humanoid == nil or humanoid.Health <= 0 then
+            return nil
+        end
+        return { character = character, root = root, humanoid = humanoid }
+    end
+
+    -- Alchemy ---------------------------------------------------------------
+
+    local alchemyTelemetry = {
+        status = "waiting",
+        recipes = 0,
+        selected = nil,
+        craftAttempts = 0,
+        pickupAttempts = 0,
+        lastError = nil,
+        canUse = nil,
+        inProgress = nil,
+        ready = nil,
+        checkTotal = 0,
+        rebirthPassed = 0,
+        materialChecks = 0,
+        craftable = 0,
+        directCraftable = 0,
+        directSchemaErrors = 0,
+        predicateErrors = 0,
+        chosenId = nil,
+        remoteResult = nil,
+        travel = "idle",
+        confirmed = false,
+        confirmedAction = nil,
+        stageCandidateId = nil,
+        temporaryBagUsed = nil,
+        transferStatus = "idle",
+    }
+    local worldEvent = {
+        phase = "idle",
+        eventId = nil,
+        completedEventId = nil,
+        entryTarget = nil,
+        lastError = nil,
+        status = "idle",
+        entryStage = "door",
+        returnState = "idle",
+        returnEventId = nil,
+        weatherScanAt = 0,
+        weatherActive = false,
+        weatherName = nil,
+        -- Confirmed inside the dragon arena. The open RebirthLockDoor is the
+        -- only pre-entry authorization and approach waypoint; this position
+        -- is used only after aligning with that live door.
+        fallbackEntry = Vector3.new(-452.6, 10.2, -137.2),
+        -- User-marked combat orbit center from the passive cycle capture while
+        -- InEventCombat=1. Keep combat Running stable instead of following the
+        -- dragon's moving root around the arena.
+        orbitCenter = Vector3.new(-454.7, 10.2, -179.6),
+    }
+
+    function worldEvent:CurrentId()
+        return Common.dragonWorldEventId(playerNumber("curEventId"))
+    end
+
+    function worldEvent:CombatValue()
+        return tonumber(playerNumber("InEventCombat")) or 0
+    end
+
+    function worldEvent:InvitationValue()
+        local notices = player:FindFirstChild("事件通知")
+        local invitation = notices and notices:FindFirstChild("Mysterious Event")
+        if invitation == nil then return 0 end
+        local ok, value = pcall(function() return invitation.Value end)
+        if not ok then return 0 end
+        if value == true then return 1 end
+        return tonumber(value) or 0
+    end
+
+    function worldEvent:CountdownSeconds()
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        local weather = playerGui
+            and playerGui:FindFirstChild("Buff_EventWeather", true)
+        local timer = weather and weather:FindFirstChild("Time")
+        if timer == nil then return nil end
+        local ok, text = pcall(function() return tostring(timer.Text) end)
+        if not ok then return nil end
+        local minutes, seconds = string.match(text, "^%s*(%d+):(%d+)%s*$")
+        if minutes == nil or seconds == nil then return nil end
+        return tonumber(minutes) * 60 + tonumber(seconds)
+    end
+
+    function worldEvent:AvailableId()
+        local eventId = self:CurrentId()
+        if eventId == nil then return nil end
+        -- Config/notification/timer/altar state and old boss/participant
+        -- surfaces can remain stale or belong to Light/Dark events. Only the
+        -- physical gate authorizes pre-entry; local combat retains ownership
+        -- after the server confirms that the player crossed it.
+        if self:FindOpenDoor() ~= nil
+            or self:CombatValue() > 0
+        then
+            return eventId
+        end
+        return nil
+    end
+
+    function worldEvent:DragonWeatherActive()
+        local now = os.clock()
+        if now < (tonumber(self.weatherScanAt) or 0) then
+            return self.weatherActive == true
+        end
+        self.weatherScanAt = now + 1
+        self.weatherActive = false
+        self.weatherName = nil
+        if type(getgc) ~= "function" then return false end
+        local ok, objects = pcall(getgc, true)
+        if not ok or type(objects) ~= "table" then return false end
+        for _, object in ipairs(objects) do
+            if type(object) == "table" then
+                local facility = rawget(object, "Facility")
+                local weather = rawget(object, "Weather")
+                if facility == "DragonNest"
+                    and (weather == "FireDragon" or weather == "DarkDragon")
+                then
+                    self.weatherActive = true
+                    self.weatherName = weather
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    function worldEvent:ShouldPrewait()
+        -- No captured pre-countdown value distinguishes dragon, SpecialEnemy
+        -- and idle weather reliably. Waiting speculatively is worse than
+        -- joining on the first live boss/participant signal.
+        return false
+    end
+
+    function worldEvent:ResetReturnPreparation()
+        self.returnState = "idle"
+        self.returnEventId = nil
+    end
+
+    function worldEvent:NeedsBaseReturn()
+        if cfg.AutoWorldEvent ~= true or self:CombatValue() > 0 then
+            return false
+        end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil or challenge <= 0 then return false end
+
+        -- Once a live door has authorized a return, keep that episode latched
+        -- until replicated dungeon state confirms base arrival. A transient
+        -- door replication gap must not resume farming between return retries.
+        if self.returnState == "returning" then return true end
+
+        local currentId = self:AvailableId()
+        if self.phase == "cooldown"
+            and currentId ~= nil
+            and currentId == tonumber(self.completedEventId)
+        then
+            return false
+        end
+        return currentId ~= nil
+    end
+
+    function worldEvent:BaseEconomyPending()
+        return self.returnState == "base-economy"
+    end
+
+    function worldEvent:OwnsObjective()
+        if cfg.AutoWorldEvent ~= true then return false end
+        if self:CombatValue() > 0 then return true end
+        if self:NeedsBaseReturn() then return true end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil or challenge > 0 then return false end
+        if self:BaseEconomyPending() then return true end
+        if self:ShouldPrewait() then return true end
+        local currentId = self:AvailableId()
+        if self.phase == "cooldown"
+            and currentId ~= nil
+            and currentId == tonumber(self.completedEventId)
+        then
+            return false
+        end
+        return self:CombatValue() > 0
+            or currentId ~= nil
+            or self.phase == "prewait"
+            or self.phase == "seeking"
+            or self.phase == "combat"
+    end
+
+    local basePriority = {
+        phase = "alchemy",
+        generation = 0,
+        reason = "initial base check",
+        alchemyOutcome = nil,
+    }
+    local broomFarmRoute = {
+        stage = nil,
+        bypassEnterDelay = false,
+        approachHumanoid = nil,
+        approachRoot = nil,
+    }
+
+    function broomFarmRoute:StopGateApproach()
+        local humanoid = self.approachHumanoid
+        local root = self.approachRoot
+        self.approachHumanoid = nil
+        self.approachRoot = nil
+        if humanoid ~= nil and root ~= nil and root.Parent ~= nil then
+            pcall(function()
+                humanoid:MoveTo(root.Position)
+            end)
+        end
+    end
+
+    function broomFarmRoute:GateEntryPoint()
+        local firstStage = stagePart(1)
+        local secondStage = nil
+        for candidate = 2, MAX_FARM_STAGE do
+            secondStage = stagePart(candidate)
+            if secondStage ~= nil then break end
+        end
+        if firstStage == nil or secondStage == nil then return nil end
+
+        local firstPoint = groundPoint(firstStage)
+        local secondPoint = groundPoint(secondStage)
+        local axisDelta = secondPoint - firstPoint
+        local planarAxis = Vector3.new(axisDelta.X, 0, axisDelta.Z)
+        if planarAxis.Magnitude < 1 then return nil end
+
+        -- Stages 1 and 2 define the entrance axis. Stay just outside the first
+        -- footprint so Broom can satisfy the server's proximity check without
+        -- accidentally walking into stage 1 when the selected skip is later.
+        local entryDirection = -planarAxis.Unit
+        local localDirection = firstStage.CFrame:VectorToObjectSpace(entryDirection)
+        local distanceToX = math.huge
+        local distanceToZ = math.huge
+        if math.abs(localDirection.X) > 0.0001 then
+            distanceToX = firstStage.Size.X * 0.5 / math.abs(localDirection.X)
+        end
+        if math.abs(localDirection.Z) > 0.0001 then
+            distanceToZ = firstStage.Size.Z * 0.5 / math.abs(localDirection.Z)
+        end
+        local entryOffset = math.min(distanceToX, distanceToZ)
+        if entryOffset == math.huge then return nil end
+        return firstPoint + entryDirection * (entryOffset + 6)
+    end
+
+    function broomFarmRoute:ApproachGate()
+        local parts = characterParts()
+        local target = self:GateEntryPoint()
+        if parts == nil or target == nil then
+            self:StopGateApproach()
+            return false, "broom stage entrance unavailable"
+        end
+
+        local delta = target - parts.root.Position
+        local distance = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        if distance <= 4 then
+            self:StopGateApproach()
+            return true, "broom at stage entrance"
+        end
+
+        if self.approachHumanoid ~= nil
+            and self.approachHumanoid ~= parts.humanoid
+        then
+            self:StopGateApproach()
+        end
+        self.approachHumanoid = parts.humanoid
+        self.approachRoot = parts.root
+        local moved = pcall(function()
+            parts.humanoid:MoveTo(target)
+        end)
+        if not moved then
+            self:StopGateApproach()
+            return false, "broom could not approach stage entrance"
+        end
+        return true, string.format(
+            "broom approaching stage entrance %.1f studs",
+            distance
+        )
+    end
+
+    local function setBasePriorityPhase(phase, reason)
+        basePriority.phase = phase
+        basePriority.reason = tostring(reason or phase)
+    end
+
+    local function resetBasePriority(reason)
+        basePriority.generation += 1
+        basePriority.alchemyOutcome = nil
+        setBasePriorityPhase("alchemy", reason)
+    end
+
+    local function broomEconomyGate()
+        if not configReady then return false, "broom waiting for config" end
+        if worldEvent:OwnsObjective() then
+            return false, "broom waiting for World Event"
+        end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil then return false, "broom waiting for dungeon state" end
+        if challenge > 0 or basePriority.phase == "broom" then return true end
+        return false, "broom waiting for " .. basePriority.phase
+    end
+
+    local function farmObjectiveGate()
+        if not configReady then return false, "farm waiting for config" end
+        if worldEvent:OwnsObjective() then
+            return false, "objective waiting for World Event"
+        end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil then return false, "farm waiting for dungeon state" end
+        if challenge <= 0 then
+            broomFarmRoute.stage = nil
+            broomFarmRoute.bypassEnterDelay = false
+        end
+        if challenge > 0 then return true end
+        if basePriority.phase ~= "broom" then
+            return false, "farm waiting for " .. basePriority.phase
+        end
+        if cfg.AutoBroom then return false, "farm waiting for Broom" end
+        return true
+    end
+    local alchemyRecovery = {
+        key = nil,
+        candidateIds = {},
+        cursor = 1,
+        nextAttemptAt = 0,
+    }
+
+    function worldEvent:Sync()
+        local previousPhase = self.phase
+        local nextPhase, activeId, completedId, finished = Common.worldEventTransition(
+            self.phase,
+            self.eventId,
+            self.completedEventId,
+            self:AvailableId(),
+            playerNumber("InEventCombat"),
+            cfg.AutoWorldEvent == true
+        )
+        if nextPhase == "idle" and self:ShouldPrewait() then
+            nextPhase = "prewait"
+        end
+        self.phase = nextPhase
+        self.eventId = activeId
+        self.completedEventId = completedId
+
+        local challenge = playerNumber("InDungeonChallenge")
+        if cfg.AutoWorldEvent ~= true
+            or nextPhase == "combat"
+            or nextPhase == "cooldown"
+            or (nextPhase == "idle"
+                and (challenge == nil or challenge <= 0)
+                and self.returnState ~= "returning"
+                and self.returnState ~= "base-economy")
+        then
+            self:ResetReturnPreparation()
+        end
+
+        if nextPhase == "idle" then
+            self.entryTarget = nil
+            self.entryStage = "door"
+            self.lastError = nil
+            self.status = "idle"
+        elseif nextPhase == "prewait" then
+            self.entryTarget = nil
+            self.status = "event begins in 10s; waiting at base"
+        elseif nextPhase == "seeking" then
+            self.status = "walking to event"
+        elseif nextPhase == "combat" then
+            self.status = "event combat"
+        elseif nextPhase == "cooldown" then
+            self.entryTarget = nil
+            self.entryStage = "door"
+            self.status = "event complete; objectives resumed"
+        end
+
+        if previousPhase ~= nextPhase and nextPhase == "seeking" then
+            self.entryTarget = nil
+            self.entryStage = "door"
+        end
+
+        if previousPhase ~= nextPhase then
+            if nextPhase == "prewait" then
+                notify("Dragon event in 10 seconds; waiting at base")
+            elseif nextPhase == "seeking" then
+                notify("Dragon event detected; pausing objectives")
+            elseif nextPhase == "combat" then
+                notify("Dragon event entered; attacking until server return")
+            end
+        end
+        if finished then
+            self:ResetReturnPreparation()
+            broomFarmRoute.stage = nil
+            broomFarmRoute.bypassEnterDelay = false
+            resetBasePriority("world event finished")
+            notify("Dragon event finished; resuming base priority")
+        end
+        return nextPhase, finished
+    end
+    local alchemyPickupNextAttemptAt = 0
+    local alchemyBaseSyncUntil = 0
+    local ALCHEMY_BASE_SYNC_SECONDS = 0.35
+    local ALCHEMY_STAGE_RESCAN_SECONDS = 0.8
+    local ALCHEMY_STAGE_RESCAN_INTERVAL = 0.1
+    local ALCHEMY_STAGE_IDLE_SCAN_INTERVAL = 0.5
+    local ALCHEMY_TRANSFER_SETTLE_SECONDS = 0.2
+    local ALCHEMY_TRANSFER_TIMEOUT_SECONDS = 3
+    local alchemyBagFingerprint = function()
+        return nil, "Bag fingerprint unavailable"
+    end
+    local inheritedTransfer = type(alchemyInvokeLease.inventoryTransfer) == "table"
+        and alchemyInvokeLease.inventoryTransfer
+        or nil
+    local alchemyInventoryTransfer = {
+        epoch = inheritedTransfer ~= nil
+            and math.floor(tonumber(inheritedTransfer.epoch) or -1)
+            or -1,
+        baselineFingerprint = inheritedTransfer ~= nil
+            and inheritedTransfer.baselineFingerprint
+            or nil,
+        lastFingerprint = inheritedTransfer ~= nil
+            and inheritedTransfer.lastFingerprint
+            or nil,
+        pending = inheritedTransfer ~= nil and inheritedTransfer.pending == true,
+        changed = inheritedTransfer ~= nil and inheritedTransfer.changed == true,
+        permanentChanged = inheritedTransfer ~= nil
+            and inheritedTransfer.permanentChanged == true,
+        refreshed = inheritedTransfer ~= nil and inheritedTransfer.refreshed == true,
+        stableSince = inheritedTransfer ~= nil
+            and tonumber(inheritedTransfer.stableSince) or 0,
+        deadline = inheritedTransfer ~= nil
+            and tonumber(inheritedTransfer.deadline) or 0,
+    }
+    local inheritedStageCandidate = type(alchemyInvokeLease.stageCandidate) == "table"
+        and alchemyInvokeLease.stageCandidate
+        or nil
+    local inheritedStageEpoch = inheritedStageCandidate ~= nil
+        and math.floor(tonumber(inheritedStageCandidate.epoch) or -1)
+        or -1
+    local inheritedStageRecipeId = inheritedStageCandidate ~= nil
+        and math.floor(tonumber(inheritedStageCandidate.recipeId) or 0)
+        or 0
+    local inheritedStageFingerprint = inheritedStageCandidate ~= nil
+        and inheritedStageCandidate.bagFingerprint
+        or nil
+    local inheritedStageFresh = inheritedStageEpoch == alchemyInvokeLease.inventoryEpoch
+        and inheritedStageRecipeId > 0
+        and type(inheritedStageFingerprint) == "string"
+    local alchemyStageCandidate = {
+        epoch = inheritedStageFresh and inheritedStageEpoch or -1,
+        recipeId = inheritedStageFresh and inheritedStageRecipeId or nil,
+        bagFingerprint = inheritedStageFresh and inheritedStageFingerprint or nil,
+        candidateFresh = inheritedStageFresh,
+        nextScanAt = 0,
+        rescanUntil = 0,
+    }
+    if inheritedStageFresh then
+        alchemyTelemetry.stageCandidateId = inheritedStageRecipeId
+    else
+        alchemyInvokeLease.stageCandidate = nil
+    end
+
+    local function resetAlchemyRecovery()
+        alchemyRecovery.key = nil
+        alchemyRecovery.candidateIds = {}
+        alchemyRecovery.cursor = 1
+        alchemyRecovery.nextAttemptAt = 0
+    end
+
+    local function clearAlchemyStageCandidate(epoch)
+        alchemyStageCandidate.epoch = tonumber(epoch) or -1
+        alchemyStageCandidate.recipeId = nil
+        alchemyStageCandidate.bagFingerprint = nil
+        alchemyStageCandidate.candidateFresh = false
+        alchemyStageCandidate.nextScanAt = 0
+        alchemyStageCandidate.rescanUntil = 0
+        alchemyTelemetry.stageCandidateId = nil
+        alchemyInvokeLease.stageCandidate = nil
+    end
+
+    local function publishAlchemyStageCandidate()
+        if not alchemyStageCandidate.candidateFresh
+            or alchemyStageCandidate.recipeId == nil
+            or type(alchemyStageCandidate.bagFingerprint) ~= "string"
+        then
+            alchemyInvokeLease.stageCandidate = nil
+            return
+        end
+        alchemyInvokeLease.stageCandidate = {
+            epoch = alchemyStageCandidate.epoch,
+            recipeId = alchemyStageCandidate.recipeId,
+            bagFingerprint = alchemyStageCandidate.bagFingerprint,
+        }
+    end
+
+    local function publishAlchemyInventoryTransfer()
+        if alchemyInventoryTransfer.epoch < 0 then
+            alchemyInvokeLease.inventoryTransfer = nil
+            return
+        end
+        alchemyInvokeLease.inventoryTransfer = {
+            epoch = alchemyInventoryTransfer.epoch,
+            baselineFingerprint = alchemyInventoryTransfer.baselineFingerprint,
+            lastFingerprint = alchemyInventoryTransfer.lastFingerprint,
+            pending = alchemyInventoryTransfer.pending,
+            changed = alchemyInventoryTransfer.changed,
+            permanentChanged = alchemyInventoryTransfer.permanentChanged,
+            refreshed = alchemyInventoryTransfer.refreshed,
+            stableSince = alchemyInventoryTransfer.stableSince,
+            deadline = alchemyInventoryTransfer.deadline,
+        }
+    end
+
+    local function finishAlchemyInventoryTransfer(status)
+        alchemyInventoryTransfer.pending = false
+        alchemyInventoryTransfer.deadline = 0
+        alchemyTelemetry.transferStatus = status
+        publishAlchemyInventoryTransfer()
+    end
+
+    local function alchemyInventoryTransferPending()
+        return alchemyInventoryTransfer.pending == true
+    end
+
+    local function observeAlchemyLocation(challenge)
+        local now = os.clock()
+        if challenge > 0 then
+            if not alchemyInvokeLease.inventoryStageActive then
+                alchemyInvokeLease.inventoryEpoch += 1
+                alchemyInvokeLease.inventoryStageActive = true
+                clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+                local fingerprint = alchemyBagFingerprint()
+                alchemyInventoryTransfer.epoch = alchemyInvokeLease.inventoryEpoch
+                alchemyInventoryTransfer.baselineFingerprint = fingerprint
+                alchemyInventoryTransfer.lastFingerprint = fingerprint
+                alchemyInventoryTransfer.pending = false
+                alchemyInventoryTransfer.changed = false
+                alchemyInventoryTransfer.permanentChanged = false
+                alchemyInventoryTransfer.refreshed = false
+                alchemyInventoryTransfer.stableSince = now
+                alchemyInventoryTransfer.deadline = 0
+                alchemyTelemetry.transferStatus = "temporary bag collecting"
+                publishAlchemyInventoryTransfer()
+            end
+            alchemyTelemetry.temporaryBagUsed = playerNumber("LimitBagUsed")
+            return
+        end
+        if alchemyInvokeLease.inventoryStageActive then
+            -- Dungeon drops live in the small temporary LimitBag. Only after
+            -- returning do they move into PlayerData.Bag (the visible 999-slot
+            -- inventory used by CanCraftRecipe). Reserve this base window until
+            -- the permanent material fingerprint changes and settles.
+            local fingerprint = alchemyBagFingerprint()
+            local temporaryUsed = playerNumber("LimitBagUsed")
+            alchemyTelemetry.temporaryBagUsed = temporaryUsed
+            alchemyInventoryTransfer.epoch = alchemyInvokeLease.inventoryEpoch
+            alchemyInventoryTransfer.lastFingerprint = fingerprint
+            alchemyInventoryTransfer.permanentChanged = fingerprint ~= nil
+                and alchemyInventoryTransfer.baselineFingerprint ~= nil
+                and fingerprint ~= alchemyInventoryTransfer.baselineFingerprint
+            alchemyInventoryTransfer.changed = alchemyInventoryTransfer.permanentChanged
+            if temporaryUsed ~= nil and temporaryUsed <= 0 then
+                -- The temporary bag clearing is the game's direct handoff
+                -- signal. Start the local Best scan in this same base tick;
+                -- if PlayerData lags, subsequent 0.1 s polls re-evaluate it.
+                alchemyInventoryTransfer.changed = true
+            end
+            alchemyInventoryTransfer.stableSince = now
+            alchemyInventoryTransfer.deadline = now
+                + ALCHEMY_TRANSFER_TIMEOUT_SECONDS
+            alchemyInventoryTransfer.pending = configReady
+                and (cfg.AutoBrew or autoSellEnabled())
+            alchemyInventoryTransfer.refreshed = false
+            alchemyTelemetry.transferStatus = alchemyInventoryTransfer.pending
+                and "waiting for temporary bag transfer"
+                or "transfer wait not required"
+            alchemyBaseSyncUntil = math.max(
+                alchemyBaseSyncUntil,
+                now + ALCHEMY_BASE_SYNC_SECONDS
+            )
+            publishAlchemyInventoryTransfer()
+        end
+        alchemyInvokeLease.inventoryStageActive = false
+
+        if not alchemyInventoryTransfer.pending then return end
+        if not configReady or (not cfg.AutoBrew and not autoSellEnabled()) then
+            finishAlchemyInventoryTransfer("transfer wait cancelled")
+            return
+        end
+        local fingerprint, fingerprintError = alchemyBagFingerprint()
+        if fingerprint ~= nil then
+            if fingerprint ~= alchemyInventoryTransfer.lastFingerprint then
+                alchemyInventoryTransfer.lastFingerprint = fingerprint
+                alchemyInventoryTransfer.stableSince = now
+                alchemyInventoryTransfer.changed = true
+                alchemyInventoryTransfer.permanentChanged = true
+                -- LimitBagUsed can reach zero before PlayerData.Bag receives
+                -- the transferred rows. Any refresh performed on that earlier
+                -- snapshot is stale; rearm it so CanCraftRecipe sees the real
+                -- permanent inventory in this same fast polling cycle.
+                alchemyInventoryTransfer.refreshed = false
+                resetAlchemyRecovery()
+                clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            end
+            local stable = alchemyInventoryTransfer.permanentChanged
+                and now - alchemyInventoryTransfer.stableSince
+                    >= ALCHEMY_TRANSFER_SETTLE_SECONDS
+            if stable then
+                alchemyBaseSyncUntil = 0
+                finishAlchemyInventoryTransfer("permanent bag synchronized")
+                return
+            end
+        else
+            alchemyTelemetry.lastError = fingerprintError
+        end
+        if now >= alchemyInventoryTransfer.deadline then
+            -- Never strand Broom/farming at base if the transfer exposes no
+            -- tp=2 delta (for example a trip that collected no ingredients).
+            finishAlchemyInventoryTransfer("transfer wait timed out")
+            return
+        end
+        alchemyTelemetry.transferStatus = "waiting for temporary bag transfer"
+        publishAlchemyInventoryTransfer()
+    end
+
+    local function resolveAlchemy()
+        local data = resolveGetData()
+        local alchemy = data and data.Alchemy
+        if type(alchemy) ~= "table" then
+            return nil, "GetData.Alchemy unavailable"
+        end
+        return alchemy
+    end
+
+    local alchemyRawRecipeCache = nil
+
+    local function rawAlchemyRecipes(alchemy)
+        if alchemyRawRecipeCache ~= nil then return alchemyRawRecipeCache end
+        -- Recipes are version configuration. Capture the first valid list once
+        -- per script load; every Best cycle thereafter only reads Bag state.
+        -- If game modules are still loading, leave the cache empty so the next
+        -- caller can retry rather than freezing a failed/empty bootstrap read.
+        if type(alchemy.GetRecipeList) ~= "function" then
+            return nil, "Alchemy.GetRecipeList unavailable"
+        end
+        local ok, recipes = pcall(alchemy.GetRecipeList)
+        if not ok then return nil, "recipe list failed: " .. tostring(recipes) end
+        if type(recipes) ~= "table" then
+            return nil, "Alchemy.GetRecipeList returned " .. type(recipes)
+        end
+        local snapshot = {}
+        local validRows = 0
+        for key, raw in pairs(recipes) do
+            if type(raw) == "table"
+                and math.floor(tonumber(raw.recipeId) or 0) > 0
+            then
+                -- Freeze catalog membership for this script load. The row is
+                -- immutable game configuration; retaining its reference avoids
+                -- duplicating nested MID/NeedCount tables on every Best tick.
+                snapshot[key] = raw
+                validRows += 1
+            end
+        end
+        if validRows == 0 then return nil, "no alchemy recipes found" end
+        alchemyRawRecipeCache = snapshot
+        return alchemyRawRecipeCache
+    end
+
+    local function isAsciiText(value)
+        if type(value) ~= "string" then return false end
+        for index = 1, #value do
+            if string.byte(value, index) > 127 then return false end
+        end
+        return true
+    end
+
+    local function translatedAlchemyRecipeName(raw, id, potionId)
+        local translationKey = nil
+        local cfgFind = resolveRuntimeModule("CfgFind")
+        if potionId > 0
+            and cfgFind ~= nil
+            and type(cfgFind.FindCfgByID) == "function"
+        then
+            -- 9 is the game's potion config type. The recipe list itself still
+            -- comes exclusively from Alchemy.GetRecipeList().
+            local cfgOk, potion = pcall(cfgFind.FindCfgByID, potionId, 9)
+            if cfgOk and type(potion) == "table" then
+                translationKey = potion.ZhName
+            end
+        end
+
+        local function translate(key)
+            if type(key) ~= "string" or key == "" then return nil end
+            local helper = resolveRuntimeModule("TranslationHelper")
+            if helper ~= nil and type(helper.TranslateByKey) == "function" then
+                local ok, translated = pcall(helper.TranslateByKey, key)
+                if ok and type(translated) == "string" and translated ~= "" then
+                    -- A not-yet-ready translator often echoes the Chinese key.
+                    -- Keep the neutral fallback until it can provide the same
+                    -- localized name shown by the game.
+                    if translated ~= key or isAsciiText(translated) then
+                        return translated
+                    end
+                end
+            end
+            if isAsciiText(key) then return key end
+            return nil
+        end
+
+        local translated = translate(translationKey)
+        if translated ~= nil then return translated end
+
+        local directName = raw.Name or raw.name
+        if type(directName) == "string" and directName ~= "" and isAsciiText(directName) then
+            return directName
+        end
+        translated = translate(raw.ZhName)
+        return translated or "Recipe"
+    end
+
+    local function alchemyRecipeCatalog(alchemy, includeLabels)
+        local rawRecipes, err = rawAlchemyRecipes(alchemy)
+        if rawRecipes == nil then return nil, err end
+
+        local catalog = {}
+        for _, raw in pairs(rawRecipes) do
+            if type(raw) == "table" then
+                local id = math.floor(tonumber(raw.recipeId) or 0)
+                if id > 0 then
+                    local potionId = math.floor(tonumber(raw.PID) or 0)
+                    local name = includeLabels == false
+                        and ("Recipe " .. tostring(id))
+                        or translatedAlchemyRecipeName(raw, id, potionId)
+                    table.insert(catalog, {
+                        id = id,
+                        potionId = potionId,
+                        rebirth = math.floor(tonumber(raw.Rebirth) or 0),
+                        label = name,
+                        recipe = raw,
+                    })
+                end
+            end
+        end
+        table.sort(catalog, function(a, b) return a.id < b.id end)
+        alchemyTelemetry.recipes = #catalog
+        if #catalog == 0 then return nil, "no alchemy recipes found" end
+        return catalog
+    end
+
+    local function isAlchemyRecipeCraftable(alchemy, recipe)
+        if type(alchemy.CanCraftRecipe) ~= "function" then
+            return false, "alchemy recipe checks unavailable", "api"
+        end
+        local rebirthOk, meetsRebirth = false, nil
+        if type(alchemy.CanMeetRecipeRebirth) == "function" then
+            rebirthOk, meetsRebirth = pcall(
+                alchemy.CanMeetRecipeRebirth,
+                player,
+                recipe.recipe
+            )
+        end
+        -- Always ask the material predicate. In live builds the rebirth facade
+        -- can be stale even though the manually selected recipe is accepted by
+        -- the server; short-circuiting here made Best silently do nothing.
+        local craftOk, canCraft = pcall(alchemy.CanCraftRecipe, player, recipe.recipe)
+        if not craftOk then return false, tostring(canCraft), "materials-error" end
+        if not canCraft then
+            if not rebirthOk then
+                -- CanCraftRecipe=false is already authoritative evidence that
+                -- this recipe lacks materials. A stale/missing rebirth helper
+                -- must not turn an empty inventory into an unknown state and
+                -- retain Alchemy forever.
+                return false,
+                    tostring(meetsRebirth),
+                    "materials-rebirth-advisory"
+            end
+            return false, nil, meetsRebirth and "materials" or "materials-rebirth"
+        end
+        if not rebirthOk then
+            return true, tostring(meetsRebirth), "craftable-rebirth-error"
+        end
+        if not meetsRebirth then
+            return true, nil, "craftable-rebirth-advisory"
+        end
+        return true, nil, "craftable"
+    end
+
+    local function alchemyMaterialCounts()
+        local bag, bagError = playerBag()
+        if bag == nil then return nil, bagError end
+        local counts = {}
+        for _, item in pairs(bag) do
+            if type(item) == "table" and tonumber(item.tp) == 2 then
+                local itemId = math.floor(tonumber(item.id) or 0)
+                if itemId > 0 then
+                    local amount = tonumber(
+                        item.count
+                        or item.Count
+                        or item.amount
+                        or item.Amount
+                        or item.num
+                        or item.Num
+                        or item.stack
+                        or item.Stack
+                    ) or 1
+                    counts[itemId] = (counts[itemId] or 0) + math.max(0, amount)
+                end
+            end
+        end
+        return counts
+    end
+
+    local function recipeAvailableFromMaterialCounts(recipe, counts)
+        local raw = type(recipe) == "table" and recipe.recipe or nil
+        local materialIds = type(raw) == "table" and raw.MID or nil
+        local requiredCounts = type(raw) == "table" and raw.NeedCount or nil
+        if type(materialIds) ~= "table" or type(requiredCounts) ~= "table" then
+            return nil, "recipe MID/NeedCount unavailable"
+        end
+        local checked = 0
+        for index, materialIdValue in pairs(materialIds) do
+            local materialId = math.floor(tonumber(materialIdValue) or 0)
+            local required = math.floor(tonumber(requiredCounts[index]) or 0)
+            if materialId <= 0 or required <= 0 then
+                return nil, "invalid recipe material row"
+            end
+            checked += 1
+            if (counts[materialId] or 0) < required then return false end
+        end
+        if checked == 0 then return nil, "empty recipe material list" end
+        return true
+    end
+
+    alchemyBagFingerprint = function()
+        local bag, bagError = playerBag()
+        if bag == nil then return nil, bagError end
+        local rows = {}
+        for key, item in pairs(bag) do
+            -- Alchemy ingredients are the Bag's tp=2 material entries. A
+            -- finished-potion pickup can add a potion/equipment row while the
+            -- ingredients are unchanged; including those rows would discard
+            -- the recipe proven during the stage immediately before brewing.
+            if type(item) == "table" and tonumber(item.tp) == 2 then
+                local id = math.floor(tonumber(item.id) or 0)
+                local onlyId = tostring(item.onlyID or key)
+                local amount = tonumber(
+                    item.count
+                    or item.Count
+                    or item.amount
+                    or item.Amount
+                    or item.num
+                    or item.Num
+                    or item.stack
+                    or item.Stack
+                ) or 1
+                table.insert(rows, table.concat({
+                    tostring(id),
+                    onlyId,
+                    tostring(amount),
+                    tostring(item.tp or ""),
+                    tostring(item.lock or ""),
+                }, ":"))
+            end
+        end
+        table.sort(rows)
+        return table.concat(rows, "|")
+    end
+
+    local function bestAlchemyRecipeIdFromLocalState(alchemy)
+        local rawRecipes, recipeError = rawAlchemyRecipes(alchemy)
+        if rawRecipes == nil then return nil, recipeError end
+        local bestId = nil
+        local advisoryId = nil
+        for _, raw in pairs(rawRecipes) do
+            if type(raw) == "table" then
+                local id = math.floor(tonumber(raw.recipeId) or 0)
+                if id > 0 then
+                    local craftable, _, reason = isAlchemyRecipeCraftable(alchemy, {
+                        id = id,
+                        recipe = raw,
+                    })
+                    if craftable then
+                        if reason == "craftable" then
+                            if bestId == nil or id > bestId then bestId = id end
+                        elseif advisoryId == nil or id > advisoryId then
+                            advisoryId = id
+                        end
+                    end
+                end
+            end
+        end
+        return bestId or advisoryId
+    end
+
+    local function updateStageAlchemyCandidate(alchemy)
+        local epoch = alchemyInvokeLease.inventoryEpoch
+        if alchemyStageCandidate.epoch ~= epoch then
+            clearAlchemyStageCandidate(epoch)
+        end
+
+        local now = os.clock()
+        local fingerprint = alchemyBagFingerprint()
+        if fingerprint ~= nil
+            and fingerprint ~= alchemyStageCandidate.bagFingerprint
+        then
+            -- A pickup changes Bag before every dependent local cache is
+            -- guaranteed to update. Invalidate the old answer, then rescan for
+            -- a short window even if Bag itself stops changing.
+            alchemyStageCandidate.bagFingerprint = fingerprint
+            alchemyStageCandidate.candidateFresh = false
+            alchemyTelemetry.stageCandidateId = nil
+            publishAlchemyStageCandidate()
+            alchemyStageCandidate.nextScanAt = now + ALCHEMY_STAGE_RESCAN_INTERVAL
+            alchemyStageCandidate.rescanUntil = now + ALCHEMY_STAGE_RESCAN_SECONDS
+            return nil
+        end
+        if now < alchemyStageCandidate.nextScanAt then
+            return alchemyStageCandidate.candidateFresh
+                and alchemyStageCandidate.recipeId
+                or nil
+        end
+
+        local bestId = bestAlchemyRecipeIdFromLocalState(alchemy)
+        if bestId ~= nil then
+            if not alchemyStageCandidate.candidateFresh
+                or alchemyStageCandidate.recipeId == nil
+                or bestId > alchemyStageCandidate.recipeId
+            then
+                alchemyStageCandidate.recipeId = bestId
+            end
+            -- A transient false from the same unchanged Bag must not erase a
+            -- recipe already proven true. Only an epoch/fingerprint/config
+            -- change invalidates that evidence.
+            alchemyStageCandidate.candidateFresh = true
+            alchemyTelemetry.stageCandidateId = alchemyStageCandidate.recipeId
+            publishAlchemyStageCandidate()
+        end
+        alchemyStageCandidate.nextScanAt = now + (
+            now < alchemyStageCandidate.rescanUntil
+                and ALCHEMY_STAGE_RESCAN_INTERVAL
+                or ALCHEMY_STAGE_IDLE_SCAN_INTERVAL
+        )
+        return alchemyStageCandidate.candidateFresh
+            and alchemyStageCandidate.recipeId
+            or nil
+    end
+
+    local function cachedStageAlchemyRecipeId(alchemy)
+        if cfg.BrewRecipe ~= "Best craftable" then return nil end
+        if alchemyStageCandidate.epoch ~= alchemyInvokeLease.inventoryEpoch
+            or not alchemyStageCandidate.candidateFresh
+        then
+            return nil
+        end
+        local currentFingerprint = alchemyBagFingerprint()
+        if currentFingerprint == nil
+            or currentFingerprint ~= alchemyStageCandidate.bagFingerprint
+        then
+            -- A last pickup can land between the final stage poll and the
+            -- challenge transition. Never apply an older recipe to a newer
+            -- Bag; let the normal base rescan handle that snapshot instead.
+            alchemyStageCandidate.candidateFresh = false
+            alchemyTelemetry.stageCandidateId = nil
+            publishAlchemyStageCandidate()
+            return nil
+        end
+        local currentBestId = bestAlchemyRecipeIdFromLocalState(alchemy)
+        if currentBestId ~= nil
+            and (alchemyStageCandidate.recipeId == nil
+                or currentBestId > alchemyStageCandidate.recipeId)
+        then
+            -- Upgrade from fresh evidence, but never let a stale false at base
+            -- erase the recipe already proven while collecting.
+            alchemyStageCandidate.recipeId = currentBestId
+            alchemyTelemetry.stageCandidateId = currentBestId
+            publishAlchemyStageCandidate()
+        end
+        return alchemyStageCandidate.recipeId
+    end
+
+    local function noteAlchemyRecipeCheck(reason)
+        if reason == "craftable" or reason == "materials" then
+            alchemyTelemetry.rebirthPassed += 1
+        end
+        if reason ~= "api" then alchemyTelemetry.materialChecks += 1 end
+        if reason == "craftable"
+            or reason == "craftable-rebirth-advisory"
+            or reason == "craftable-rebirth-error"
+        then
+            alchemyTelemetry.craftable += 1
+        end
+        if reason == "craftable-rebirth-error"
+            or reason == "materials-error"
+            or reason == "api"
+        then
+            alchemyTelemetry.predicateErrors += 1
+        end
+    end
+
+    local function selectAlchemyRecipe(alchemy, selection, stagedRecipeId)
+        selection = tostring(selection or "Best craftable")
+        local recoveryPrefix = "infinity-best-v2|" .. selection .. "|"
+
+        local catalog, err = alchemyRecipeCatalog(alchemy, false)
+        if catalog == nil then return nil, err end
+
+        alchemyTelemetry.checkTotal = #catalog
+        alchemyTelemetry.rebirthPassed = 0
+        alchemyTelemetry.materialChecks = 0
+        alchemyTelemetry.craftable = 0
+        alchemyTelemetry.directCraftable = 0
+        alchemyTelemetry.directSchemaErrors = 0
+        alchemyTelemetry.predicateErrors = 0
+        alchemyTelemetry.chosenId = nil
+        local candidateById = {}
+        local membershipIds = {}
+        local prioritizedIds = {}
+        if selection == "Best craftable" then
+            -- CanCraftRecipe is false for every recipe in the observed live
+            -- client, even when Bag + MID/NeedCount prove materials exist.
+            -- Aggregate the permanent Bag once, evaluate every recipe locally,
+            -- and retain only the highest available id for one server request.
+            local best = nil
+            local advisoryBest = nil
+            local sawDirectSchema = false
+            local stagedFallback = nil
+            local currentRebirth = playerNumber("Rebirth")
+            stagedRecipeId = math.floor(tonumber(stagedRecipeId) or 0)
+            if stagedRecipeId > 0 then
+                for _, recipe in ipairs(catalog) do
+                    if recipe.id == stagedRecipeId then
+                        stagedFallback = recipe
+                        break
+                    end
+                end
+            end
+            local materialCounts, materialCountError = alchemyMaterialCounts()
+            if materialCounts == nil then return nil, materialCountError end
+            for _, recipe in ipairs(catalog) do
+                local directAvailable, directError =
+                    recipeAvailableFromMaterialCounts(recipe, materialCounts)
+                if directAvailable == nil then
+                    alchemyTelemetry.directSchemaErrors += 1
+                    local craftable, _, reason = isAlchemyRecipeCraftable(
+                        alchemy,
+                        recipe
+                    )
+                    noteAlchemyRecipeCheck(reason)
+                    if craftable then
+                        if reason == "craftable" then
+                            best = recipe
+                        else
+                            advisoryBest = recipe
+                        end
+                    end
+                else
+                    sawDirectSchema = true
+                    alchemyTelemetry.materialChecks += 1
+                    local rebirthAllowed = nil
+                    if currentRebirth ~= nil then
+                        rebirthAllowed = currentRebirth >= recipe.rebirth
+                    end
+                    if rebirthAllowed == nil and directAvailable
+                        and type(alchemy.CanMeetRecipeRebirth) == "function"
+                    then
+                        local ok, allowed = pcall(
+                            alchemy.CanMeetRecipeRebirth,
+                            player,
+                            recipe.recipe
+                        )
+                        if ok then rebirthAllowed = allowed == true end
+                    end
+                    if rebirthAllowed == true then
+                        alchemyTelemetry.rebirthPassed += 1
+                    end
+                    if directAvailable then
+                        alchemyTelemetry.directCraftable += 1
+                        if rebirthAllowed == true then
+                            alchemyTelemetry.craftable += 1
+                            best = recipe
+                        elseif rebirthAllowed == nil then
+                            advisoryBest = recipe
+                        end
+                    end
+                end
+            end
+            if not sawDirectSchema and stagedFallback ~= nil then
+                best = stagedFallback
+            end
+            best = best or advisoryBest
+            if best ~= nil then
+                candidateById[best.id] = best
+                table.insert(membershipIds, best.id)
+                table.insert(prioritizedIds, best.id)
+            end
+        else
+            local selectedId = math.floor(tonumber(selection) or 0)
+            if selectedId <= 0 then
+                selectedId = math.floor(tonumber(string.match(selection, "^#(%d+)")) or 0)
+            end
+            for _, recipe in ipairs(catalog) do
+                if selection == recipe.label or selectedId == recipe.id then
+                    local _, _, reason = isAlchemyRecipeCraftable(alchemy, recipe)
+                    noteAlchemyRecipeCheck(reason)
+                    candidateById[recipe.id] = recipe
+                    table.insert(membershipIds, recipe.id)
+                    table.insert(prioritizedIds, recipe.id)
+                    break
+                end
+            end
+        end
+
+        if #membershipIds == 0 then
+            if selection == "Best craftable" then resetAlchemyRecovery() end
+            return nil, selection == "Best craftable"
+                and "waiting for the game to report a craftable recipe"
+                or "selected recipe is unavailable"
+        end
+
+        -- A changed local Best is new inventory evidence. Give it a fresh
+        -- request immediately instead of preserving the cooldown/order of a
+        -- different recipe selected from an older Bag snapshot.
+        local recoveryKey = recoveryPrefix .. table.concat(membershipIds, ",")
+        if alchemyRecovery.key ~= recoveryKey then
+            alchemyRecovery.key = recoveryKey
+            alchemyRecovery.candidateIds = {}
+            for _, id in ipairs(prioritizedIds) do
+                table.insert(alchemyRecovery.candidateIds, id)
+            end
+            alchemyRecovery.cursor = 1
+            alchemyRecovery.nextAttemptAt = 0
+        end
+        if os.clock() < alchemyRecovery.nextAttemptAt then
+            return nil, "waiting before the next server-validated recipe", "cooldown"
+        end
+
+        if alchemyRecovery.cursor > #alchemyRecovery.candidateIds then
+            alchemyRecovery.cursor = 1
+        end
+        local candidateId = alchemyRecovery.candidateIds[alchemyRecovery.cursor]
+        local candidate = candidateById[candidateId]
+        if candidate == nil then
+            resetAlchemyRecovery()
+            return nil, "recipe candidate changed; retrying"
+        end
+        alchemyTelemetry.chosenId = candidate.id
+        return candidate
+    end
+
+    local function finishAlchemyRecipeAttempt(confirmed)
+        if confirmed then
+            -- Materials changed after a successful craft. Rebuild local
+            -- priorities before choosing the next potion.
+            resetAlchemyRecovery()
+            if alchemyInventoryTransferPending() then
+                finishAlchemyInventoryTransfer("brew started after bag transfer")
+            end
+            return
+        end
+        local count = #alchemyRecovery.candidateIds
+        local delay = cfg.BrewRecipe == "Best craftable" and 2 or 8
+        if count > 1 then
+            local nextCursor = (alchemyRecovery.cursor % count) + 1
+            alchemyRecovery.cursor = nextCursor
+            delay = nextCursor == 1 and 15 or 4
+        end
+        -- Keep a conservative delay after every rejected or ambiguous request.
+        -- Explicit recipes retry the same id; Best advances one candidate and
+        -- applies a longer delay when a full round wraps.
+        alchemyRecovery.nextAttemptAt = os.clock() + delay
+    end
+
+    local function alchemyDropdownValues()
+        local values = { "Best craftable" }
+        local alchemy = resolveAlchemy()
+        if alchemy == nil then return values end
+        local catalog = alchemyRecipeCatalog(alchemy)
+        if catalog == nil then return values end
+        for _, recipe in ipairs(catalog) do
+            table.insert(values, {
+                Value = tostring(recipe.id),
+                Text = recipe.label,
+            })
+        end
+        return values
+    end
+
+    local function alchemyBestDiagnosticReport()
+        local lines = {
+            "InfinityGold Best craftable diagnostic",
+            "status=" .. tostring(alchemyTelemetry.status),
+            "transfer=" .. tostring(alchemyTelemetry.transferStatus),
+        }
+        local seen = {}
+        local function describe(value, depth)
+            local valueType = typeof(value)
+            if valueType == "Instance" then
+                return "<Instance:" .. tostring(value.ClassName) .. ">"
+            end
+            local luaType = type(value)
+            if luaType == "string" then
+                local text = value
+                if #text > 160 then text = string.sub(text, 1, 160) .. "..." end
+                return string.format("%q", text)
+            end
+            if luaType == "number" or luaType == "boolean" or luaType == "nil" then
+                return tostring(value)
+            end
+            if luaType ~= "table" then return "<" .. luaType .. ">" end
+            if seen[value] then return "<cycle>" end
+            if depth <= 0 then return "{...}" end
+            seen[value] = true
+            local keys = {}
+            for key in pairs(value) do table.insert(keys, key) end
+            table.sort(keys, function(left, right)
+                return tostring(left) < tostring(right)
+            end)
+            local parts = {}
+            for index, key in ipairs(keys) do
+                if index > 40 then
+                    table.insert(parts, "...=" .. tostring(#keys - 40) .. " more")
+                    break
+                end
+                table.insert(parts,
+                    "[" .. describe(key, 1) .. "]=" .. describe(value[key], depth - 1))
+            end
+            seen[value] = nil
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+
+        local bag, bagError = playerBag()
+        if bag == nil then
+            table.insert(lines, "BAG ERROR: " .. tostring(bagError))
+        else
+            local materials = {}
+            for key, item in pairs(bag) do
+                if type(item) == "table" and tonumber(item.tp) == 2 then
+                    table.insert(materials, {
+                        id = math.floor(tonumber(item.id) or 0),
+                        key = tostring(key),
+                        item = item,
+                    })
+                end
+            end
+            table.sort(materials, function(left, right)
+                if left.id ~= right.id then return left.id < right.id end
+                return left.key < right.key
+            end)
+            table.insert(lines, "BAG MATERIAL ROWS=" .. tostring(#materials))
+            for _, entry in ipairs(materials) do
+                table.insert(lines, "bag " .. tostring(entry.id) .. " "
+                    .. describe(entry.item, 3))
+            end
+        end
+
+        local alchemy, resolveError = resolveAlchemy()
+        if alchemy == nil then
+            table.insert(lines, "ALCHEMY ERROR: " .. tostring(resolveError))
+        else
+            local catalog, catalogError = alchemyRecipeCatalog(alchemy)
+            if catalog == nil then
+                table.insert(lines, "RECIPE ERROR: " .. tostring(catalogError))
+            else
+                table.insert(lines, "RECIPES=" .. tostring(#catalog))
+                for index = #catalog, 1, -1 do
+                    local recipe = catalog[index]
+                    local craftable, checkError, reason = isAlchemyRecipeCraftable(
+                        alchemy,
+                        recipe
+                    )
+                    table.insert(lines, string.format(
+                        "recipe %d pid=%d rebirth=%d craftable=%s reason=%s error=%s raw=%s",
+                        recipe.id,
+                        recipe.potionId,
+                        recipe.rebirth,
+                        tostring(craftable),
+                        tostring(reason),
+                        tostring(checkError),
+                        describe(recipe.recipe, 4)
+                    ))
+                end
+            end
+        end
+
+        local report = table.concat(lines, "\n")
+        if #report > 30000 then
+            report = string.sub(report, 1, 30000)
+                .. "\n<report truncated at 30000 characters>"
+        end
+        return report
+    end
+
+    local function alchemyState(alchemy, methodName)
+        local method = alchemy[methodName]
+        if type(method) ~= "function" then
+            return nil, methodName .. " unavailable"
+        end
+        local ok, value = pcall(method, player)
+        if not ok then return nil, tostring(value) end
+        if value == nil then return nil, methodName .. " returned nil" end
+        return not not value
+    end
+
+    local function waitForAlchemyConfirmation(alchemy, kind, initialReady)
+        -- A successful pcall is merely transport, not proof that the server
+        -- accepted the remote action. Confirm it from replicated game state.
+        for attempt = 1, 10 do
+            if not sessionAlive then return false, "alchemy session closed" end
+            if kind == "brew" and not cfg.AutoBrew then
+                return false, "brew cancelled"
+            end
+            if kind == "pickup" and not cfg.AutoPickupPotion then
+                return false, "pickup cancelled"
+            end
+            if kind == "brew" then
+                local brewing = alchemyState(alchemy, "IsBrewInProgress")
+                if brewing ~= nil then alchemyTelemetry.inProgress = brewing end
+                if brewing == true then return true, "brewing" end
+                local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+                if ready ~= nil then alchemyTelemetry.ready = ready end
+                if initialReady == false and ready == true then return true, "ready" end
+            else
+                local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+                if ready ~= nil then alchemyTelemetry.ready = ready end
+                if initialReady == true and ready == false then return true, "picked up" end
+            end
+            if attempt < 10 then task.wait(0.25) end
+        end
+        return false, kind .. " was not confirmed by game state"
+    end
+
+    local function alchemyResponseRejected(response)
+        if response == false then return true, "server returned false" end
+        if type(response) ~= "table" then return false end
+        for _, key in ipairs({ "success", "Success", "ok", "accepted", "result" }) do
+            if response[key] == false then
+                local detail = response.error or response.Error or response.message
+                return true, detail ~= nil and tostring(detail) or (key .. " was false")
+            end
+        end
+        return false
+    end
+
+    local function alchemyRequestDidNotStart(err, didInvoke)
+        return didInvoke == false
+            or err == "alchemy session closed before request"
+            or err == "Alchemy config reloading before request"
+            or err == "brew cancelled before request"
+            or err == "pickup cancelled before request"
+            or err == "dungeon state unknown before Alchemy request"
+            or err == "left base before Alchemy request"
+            or err == "Bag changed before Alchemy request"
+    end
+
+    local ALCHEMY_STALE_LEASE_SECONDS = 30
+
+    local function alchemyLeaseBlocksCycle(alchemy)
+        if not alchemyInvokeLease.pending then return false end
+        local startedAt = tonumber(alchemyInvokeLease.startedAt)
+        if startedAt == nil
+            or os.clock() - startedAt < ALCHEMY_STALE_LEASE_SECONDS
+        then
+            return true
+        end
+
+        -- A dead executor coroutine must not disable Alchemy forever across
+        -- reloads. Only retire a stale lease after both authoritative game
+        -- states are readable; the normal gates below still prevent a second
+        -- request if the old one actually started/finished a potion.
+        local brewing = alchemyState(alchemy, "IsBrewInProgress")
+        local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+        if brewing == nil or ready == nil then return true end
+        alchemyInvokeLease.generation += 1
+        alchemyInvokeLease.pending = false
+        alchemyInvokeLease.startedAt = nil
+        return false
+    end
+
+    local function invokeAlchemyAction(action, payload, recoverySnapshot)
+        if alchemyInvokeLease.pending then
+            return false, nil, "a previous Alchemy request is still pending", true, false
+        end
+        alchemyInvokeLease.generation += 1
+        local token = alchemyInvokeLease.generation
+        alchemyInvokeLease.pending = true
+        alchemyInvokeLease.startedAt = os.clock()
+        local outcome = {
+            done = false,
+            timedOut = false,
+            action = action,
+            payload = payload,
+            recovery = recoverySnapshot,
+        }
+        local spawned, spawnError = pcall(task.spawn, function()
+            local function beforeInvoke()
+                if action == "ALCHEMY_CRAFT_RECIPE"
+                    and type(recoverySnapshot) == "table"
+                    and (recoverySnapshot.staged == true
+                        or type(recoverySnapshot.transferBagFingerprint) == "string")
+                then
+                    -- PlayerData is the only opaque getter in this commit
+                    -- guard and may yield. Read it first; every gate below is
+                    -- a local flag or a non-yielding Value read, so neither the
+                    -- material snapshot nor the base decision can become stale
+                    -- inside our code before InvokeServer.
+                    local finalFingerprint = alchemyBagFingerprint()
+                    local expectedFingerprint = recoverySnapshot.staged == true
+                        and recoverySnapshot.stageBagFingerprint
+                        or recoverySnapshot.transferBagFingerprint
+                    if finalFingerprint == nil
+                        or finalFingerprint ~= expectedFingerprint
+                    then
+                        return false, "Bag changed before Alchemy request"
+                    end
+                end
+                if not sessionAlive then
+                    return false, "alchemy session closed before request"
+                end
+                if not configReady then
+                    return false, "Alchemy config reloading before request"
+                end
+                if action == "ALCHEMY_CRAFT_RECIPE" and not cfg.AutoBrew then
+                    return false, "brew cancelled before request"
+                end
+                if action == "ALCHEMY_PICKUP_FINISH_POTION"
+                    and not cfg.AutoPickupPotion
+                then
+                    return false, "pickup cancelled before request"
+                end
+                local challenge = playerNumber("InDungeonChallenge")
+                if challenge == nil then
+                    return false, "dungeon state unknown before Alchemy request"
+                end
+                if challenge > 0 then
+                    return false, "left base before Alchemy request"
+                end
+                return true
+            end
+            local callOk, sent, response, err, didInvoke = pcall(
+                invokeAction,
+                action,
+                payload,
+                beforeInvoke
+            )
+            if not callOk then
+                err = tostring(sent)
+                sent = false
+                response = nil
+                didInvoke = false
+            end
+            outcome.sent = sent == true
+            outcome.response = response
+            outcome.err = err
+            outcome.didInvoke = didInvoke == true
+            outcome.done = true
+            if alchemyInvokeLease.generation == token then
+                alchemyInvokeLease.pending = false
+                alchemyInvokeLease.startedAt = nil
+                if outcome.timedOut or not sessionAlive then
+                    alchemyInvokeLease.completed = {
+                        action = action,
+                        payload = payload,
+                        sent = outcome.sent,
+                        response = response,
+                        err = err,
+                        didInvoke = outcome.didInvoke,
+                        recovery = outcome.recovery,
+                        completedAt = os.clock(),
+                    }
+                end
+            end
+        end)
+        if not spawned then
+            if alchemyInvokeLease.generation == token then
+                alchemyInvokeLease.pending = false
+                alchemyInvokeLease.startedAt = nil
+            end
+            return false,
+                nil,
+                "could not start Alchemy request: " .. tostring(spawnError),
+                false,
+                false
+        end
+
+        for _ = 1, 16 do
+            if outcome.done then
+                return outcome.sent,
+                    outcome.response,
+                    outcome.err,
+                    false,
+                    outcome.didInvoke
+            end
+            if not sessionAlive then
+                -- Detach this caller but keep the shared lease. The old request
+                -- may still finish after a reload, and its result must be
+                -- reconciled by the next session instead of being discarded.
+                outcome.timedOut = true
+                return false,
+                    nil,
+                    "alchemy session closed while request was pending",
+                    true,
+                    outcome.didInvoke
+            end
+            task.wait(0.25)
+        end
+        if outcome.done then
+            return outcome.sent,
+                outcome.response,
+                outcome.err,
+                false,
+                outcome.didInvoke
+        end
+        -- The lease deliberately remains pending. A late completion clears it;
+        -- until then neither this session nor a reload can duplicate the call.
+        outcome.timedOut = true
+        return false,
+            nil,
+            "Alchemy request timed out; waiting for late completion",
+            true,
+            outcome.didInvoke
+    end
+
+    local function reconcileLateAlchemyCompletion(alchemy)
+        local completed = alchemyInvokeLease.completed
+        if type(completed) ~= "table" then return false end
+        alchemyInvokeLease.completed = nil
+        local recovery = completed.recovery
+        local snapshotEpoch = type(recovery) == "table"
+            and tonumber(recovery.inventoryEpoch)
+            or nil
+        local inventoryUnchanged = snapshotEpoch ~= nil
+            and snapshotEpoch == alchemyInvokeLease.inventoryEpoch
+            or snapshotEpoch == nil
+                and alchemyInvokeLease.inventoryEpoch == 0
+        if alchemyRequestDidNotStart(completed.err, completed.didInvoke) then
+            if completed.action == "ALCHEMY_CRAFT_RECIPE" then
+                resetAlchemyRecovery()
+                if completed.err == "Bag changed before Alchemy request"
+                    and inventoryUnchanged
+                then
+                    clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+                end
+            elseif completed.action == "ALCHEMY_PICKUP_FINISH_POTION" then
+                alchemyPickupNextAttemptAt = 0
+            end
+            alchemyTelemetry.confirmed = false
+            alchemyTelemetry.remoteResult = completed.response
+            alchemyTelemetry.status = "late Alchemy request cancelled before send"
+            alchemyTelemetry.lastError = completed.err
+            return true, false, completed.err
+        end
+        local rejected, rejection = alchemyResponseRejected(completed.response)
+        local accepted = completed.sent == true and not rejected
+        local errorText = completed.err
+            or (rejected and tostring(rejection))
+            or "late request was not confirmed"
+
+        if completed.action == "ALCHEMY_CRAFT_RECIPE" then
+            if rejected
+                and inventoryUnchanged
+                and type(recovery) == "table"
+                and recovery.staged == true
+            then
+                clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            end
+            if type(recovery) == "table" and inventoryUnchanged then
+                alchemyRecovery.key = recovery.key
+                alchemyRecovery.candidateIds = type(recovery.candidateIds) == "table"
+                    and recovery.candidateIds
+                    or {}
+                alchemyRecovery.cursor = math.max(1, tonumber(recovery.cursor) or 1)
+                alchemyRecovery.nextAttemptAt = 0
+            end
+            local brewing = alchemyState(alchemy, "IsBrewInProgress")
+            local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+            local confirmed = accepted and (brewing == true or ready == true)
+            if confirmed then
+                finishAlchemyRecipeAttempt(true)
+                if inventoryUnchanged then
+                    clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+                end
+            elseif inventoryUnchanged then
+                finishAlchemyRecipeAttempt(false)
+            else
+                -- A stage trip changed the bag while this request was in
+                -- flight. Never resurrect the old frozen priority/cursor;
+                -- rank the current inventory afresh on the next fast tick.
+                resetAlchemyRecovery()
+            end
+            alchemyTelemetry.confirmed = confirmed
+            alchemyTelemetry.inProgress = brewing
+            alchemyTelemetry.ready = ready
+            alchemyTelemetry.remoteResult = completed.response
+            alchemyTelemetry.status = confirmed
+                and "late brew confirmed"
+                or "late brew unconfirmed"
+            alchemyTelemetry.lastError = confirmed and nil or errorText
+            if confirmed then alchemyTelemetry.confirmedAction = "brew" end
+            return true, confirmed, alchemyTelemetry.lastError
+        end
+
+        if completed.action == "ALCHEMY_PICKUP_FINISH_POTION" then
+            local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+            local confirmed = accepted and ready == false
+            alchemyTelemetry.confirmed = confirmed
+            alchemyTelemetry.ready = ready
+            alchemyTelemetry.remoteResult = completed.response
+            alchemyTelemetry.status = confirmed
+                and "late pickup confirmed"
+                or "late pickup unconfirmed"
+            alchemyTelemetry.lastError = confirmed and nil or errorText
+            alchemyPickupNextAttemptAt = confirmed and 0 or (os.clock() + 8)
+            if confirmed then
+                alchemyTelemetry.confirmedAction = "pickup"
+                resetAlchemyRecovery()
+            end
+            return true, confirmed, alchemyTelemetry.lastError
+        end
+        return false
+    end
+
+    local function refreshAlchemyUi()
+        -- This is the original local PotionBrewingGame refresh. It is strictly
+        -- fail-open: a missing bindable never changes the network result.
+        fireBindableAction(
+            "SHOW_LOCAL_UI",
+            "PotionBrewingGame",
+            nil,
+            false,
+            false
+        )
+    end
+
+    local function runAlchemyCycle()
+        alchemyTelemetry.confirmed = false
+        alchemyTelemetry.confirmedAction = nil
+        if not cfg.AutoBrew and not cfg.AutoPickupPotion then
+            resetAlchemyRecovery()
+            clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            alchemyTelemetry.status = "disabled"
+            return false
+        end
+        if not cfg.AutoBrew or cfg.BrewRecipe ~= "Best craftable" then
+            clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+        end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil then
+            alchemyTelemetry.status = "waiting for dungeon state"
+            alchemyTelemetry.lastError = nil
+            return false
+        end
+        observeAlchemyLocation(challenge)
+        if challenge > 0 then
+            -- PlayerData.Bag is the permanent inventory, not the stage's
+            -- temporary LimitBag. This passive scan can reuse older permanent
+            -- materials but never treats it as proof that new drops transferred;
+            -- the two-bag fingerprint handoff below revalidates it at base.
+            resetAlchemyRecovery()
+            local stagedId = nil
+            local stageError = nil
+            if cfg.AutoBrew and cfg.BrewRecipe == "Best craftable" then
+                local stageAlchemy
+                stageAlchemy, stageError = resolveAlchemy()
+                if stageAlchemy ~= nil then
+                    stagedId = updateStageAlchemyCandidate(stageAlchemy)
+                end
+            end
+            alchemyTelemetry.status = stagedId ~= nil
+                and ("temporary bag collecting; existing recipe #"
+                    .. tostring(stagedId))
+                or "collecting in temporary bag"
+            alchemyTelemetry.lastError = stageError
+            return false
+        end
+        local alchemy, resolveError = resolveAlchemy()
+        if alchemy == nil then
+            alchemyTelemetry.status = "waiting for game data"
+            alchemyTelemetry.lastError = resolveError
+            return false, resolveError
+        end
+        if alchemyLeaseBlocksCycle(alchemy) then
+            alchemyTelemetry.status = "waiting for previous Alchemy request"
+            alchemyTelemetry.lastError = "a prior request is still pending"
+            return false, alchemyTelemetry.lastError
+        end
+        local reconciled, reconciledOk, reconciledError = reconcileLateAlchemyCompletion(
+            alchemy
+        )
+        if reconciled then return reconciledOk, reconciledError end
+        -- Alchemy is remote-only in this experimental build. The replicated
+        -- state remains the authority; no character movement is performed.
+        if type(alchemy.CanUseAlchemy) == "function" then
+            local canUseOk, canUse = pcall(alchemy.CanUseAlchemy, player)
+            if canUseOk then
+                alchemyTelemetry.canUse = not not canUse
+            else
+                alchemyTelemetry.canUse = nil
+            end
+        else
+            alchemyTelemetry.canUse = nil
+        end
+
+        local readyBefore = nil
+        local readyError = nil
+        if type(alchemy.IsBrewReadyForPickup) == "function" then
+            local readyOk, ready = pcall(alchemy.IsBrewReadyForPickup, player)
+            if readyOk and ready ~= nil then
+                readyBefore = not not ready
+                alchemyTelemetry.ready = readyBefore
+            elseif readyOk then
+                readyError = "IsBrewReadyForPickup returned nil"
+                alchemyTelemetry.ready = nil
+            else
+                readyError = tostring(ready)
+                alchemyTelemetry.ready = nil
+            end
+        elseif cfg.AutoPickupPotion then
+            readyError = "IsBrewReadyForPickup unavailable"
+        end
+
+        if cfg.AutoPickupPotion then
+            if readyError ~= nil then
+                alchemyTelemetry.status = "waiting for pickup API"
+                alchemyTelemetry.lastError = readyError
+                return false, alchemyTelemetry.lastError
+            end
+            if readyBefore == true then
+                if os.clock() < alchemyPickupNextAttemptAt then
+                    alchemyTelemetry.status = "pickup retry cooldown"
+                    alchemyTelemetry.lastError = "waiting before retrying pickup"
+                    return false, alchemyTelemetry.lastError
+                end
+                local readyNow, readyNowError = alchemyState(
+                    alchemy,
+                    "IsBrewReadyForPickup"
+                )
+                if readyNow ~= nil then alchemyTelemetry.ready = readyNow end
+                if readyNow ~= true then
+                    alchemyTelemetry.status = "pickup state changed"
+                    alchemyTelemetry.lastError = readyNowError
+                        or "potion is no longer ready"
+                    return false, alchemyTelemetry.lastError
+                end
+                readyBefore = readyNow
+                if not sessionAlive or not cfg.AutoPickupPotion then
+                    alchemyTelemetry.status = "pickup cancelled"
+                    return false, "pickup cancelled"
+                end
+                alchemyTelemetry.pickupAttempts += 1
+                alchemyTelemetry.travel = "remote"
+                local sent, response, err, requestPending, didInvoke =
+                    invokeAlchemyAction(
+                        "ALCHEMY_PICKUP_FINISH_POTION"
+                    )
+                if requestPending then
+                    alchemyTelemetry.remoteResult = nil
+                    alchemyTelemetry.status = "pickup request still pending"
+                    alchemyTelemetry.lastError = err
+                    return false, err
+                end
+                if not sent and alchemyRequestDidNotStart(err, didInvoke) then
+                    alchemyTelemetry.pickupAttempts = math.max(
+                        0,
+                        alchemyTelemetry.pickupAttempts - 1
+                    )
+                    alchemyPickupNextAttemptAt = 0
+                    alchemyTelemetry.status = err
+                    alchemyTelemetry.lastError = nil
+                    return false, err
+                end
+                local rejected, rejection = alchemyResponseRejected(response)
+                if sent and rejected then
+                    sent = false
+                    err = "server rejected pickup: " .. tostring(rejection)
+                end
+                alchemyTelemetry.remoteResult = response
+                refreshAlchemyUi()
+                task.wait(0.5)
+                local confirmed, confirmation = false, err
+                if sent then
+                    confirmed, confirmation = waitForAlchemyConfirmation(
+                        alchemy,
+                        "pickup",
+                        readyBefore
+                    )
+                end
+                alchemyTelemetry.confirmed = confirmed
+                if confirmed then
+                    alchemyPickupNextAttemptAt = 0
+                    resetAlchemyRecovery()
+                else
+                    alchemyPickupNextAttemptAt = os.clock() + 8
+                end
+                if confirmed then
+                    alchemyTelemetry.confirmedAction = "pickup"
+                    alchemyTelemetry.lastError = nil
+                    alchemyTelemetry.status = "pickup confirmed"
+                else
+                    alchemyTelemetry.lastError = confirmation
+                    alchemyTelemetry.status = "pickup unconfirmed"
+                end
+                if not confirmed then return false, confirmation end
+                -- The station slot is free now. When Auto Brew is enabled,
+                -- continue in this same base pass so the material snapshot can
+                -- start exactly one new Best recipe immediately. A verified
+                -- empty result releases the next priority below; API/schema
+                -- errors remain fail-closed in Alchemy.
+                observeAlchemyLocation(challenge)
+                readyBefore = false
+                if not cfg.AutoBrew then return true end
+            end
+            alchemyPickupNextAttemptAt = 0
+        elseif readyBefore == true then
+            alchemyTelemetry.status = "potion ready for pickup"
+            alchemyTelemetry.lastError = "enable Auto Pickup Brewed Potion"
+            return false, alchemyTelemetry.lastError
+        end
+
+        if not cfg.AutoBrew then
+            resetAlchemyRecovery()
+            alchemyTelemetry.status = "waiting for brewed potion"
+            return false
+        end
+        if type(alchemy.IsBrewInProgress) ~= "function" then
+            alchemyTelemetry.status = "waiting for brew API"
+            alchemyTelemetry.lastError = "IsBrewInProgress unavailable"
+            return false, alchemyTelemetry.lastError
+        end
+
+        local inProgress, progressError = alchemyState(alchemy, "IsBrewInProgress")
+        alchemyTelemetry.inProgress = inProgress
+        if inProgress == nil then
+            alchemyTelemetry.status = "brew check failed"
+            alchemyTelemetry.lastError = progressError
+            return false, alchemyTelemetry.lastError
+        end
+        if inProgress then
+            finishAlchemyRecipeAttempt(true)
+            alchemyTelemetry.status = "brewing (one potion at a time)"
+            alchemyTelemetry.lastError = nil
+            return false
+        end
+
+        if alchemyInventoryTransferPending()
+            and not alchemyInventoryTransfer.changed
+        then
+            alchemyTelemetry.status = "waiting for temporary bag transfer"
+            alchemyTelemetry.lastError = nil
+            return false
+        end
+
+        local stagedRecipeId = cachedStageAlchemyRecipeId(alchemy)
+        if stagedRecipeId == nil
+            and not alchemyInventoryTransfer.changed
+            and os.clock() < alchemyBaseSyncUntil
+        then
+            alchemyTelemetry.status = "syncing dungeon materials"
+            alchemyTelemetry.lastError = nil
+            return false
+        end
+
+        if alchemyInventoryTransfer.changed
+            and not alchemyInventoryTransfer.refreshed
+        then
+            -- Ask the same local PotionBrewingGame facade used by Magic to
+            -- refresh after the permanent Bag receives the temporary drops.
+            -- This never moves the character and sends no server action.
+            refreshAlchemyUi()
+            alchemyInventoryTransfer.refreshed = true
+            publishAlchemyInventoryTransfer()
+        end
+
+        local recipe, recipeError, selectionState = selectAlchemyRecipe(
+            alchemy,
+            cfg.BrewRecipe,
+            stagedRecipeId
+        )
+        if recipe == nil then
+            alchemyTelemetry.status = selectionState == "cooldown"
+                and "brew retry cooldown"
+                or "no recipe candidate"
+            alchemyTelemetry.lastError = recipeError
+            return false, recipeError
+        end
+
+        alchemyTelemetry.selected = recipe.label
+        local progressBeforeSend, progressBeforeSendError = alchemyState(
+            alchemy,
+            "IsBrewInProgress"
+        )
+        if progressBeforeSend ~= nil then
+            alchemyTelemetry.inProgress = progressBeforeSend
+        end
+        if progressBeforeSend ~= false then
+            alchemyTelemetry.status = progressBeforeSend == true
+                and "brewing"
+                or "brew state changed"
+            alchemyTelemetry.lastError = progressBeforeSendError
+            return false, progressBeforeSendError
+        end
+        local readyBeforeSend, readyBeforeSendError = alchemyState(
+            alchemy,
+            "IsBrewReadyForPickup"
+        )
+        if readyBeforeSend ~= nil then alchemyTelemetry.ready = readyBeforeSend end
+        if readyBeforeSend ~= false then
+            alchemyTelemetry.status = readyBeforeSend == true
+                and "potion ready for pickup"
+                or "brew readiness changed"
+            alchemyTelemetry.lastError = readyBeforeSendError
+                or "a brewed potion must be picked up first"
+            return false, alchemyTelemetry.lastError
+        end
+        readyBefore = readyBeforeSend
+        if not sessionAlive or not cfg.AutoBrew then
+            alchemyTelemetry.status = "brew cancelled"
+            return false, "brew cancelled"
+        end
+        alchemyTelemetry.craftAttempts += 1
+        alchemyTelemetry.travel = "remote"
+        local recoverySnapshot = {
+            key = alchemyRecovery.key,
+            candidateIds = table.clone(alchemyRecovery.candidateIds),
+            cursor = alchemyRecovery.cursor,
+            inventoryEpoch = alchemyInvokeLease.inventoryEpoch,
+            staged = stagedRecipeId ~= nil,
+            stageRecipeId = stagedRecipeId,
+            stageBagFingerprint = stagedRecipeId ~= nil
+                and alchemyStageCandidate.bagFingerprint
+                or nil,
+            transferBagFingerprint = alchemyInventoryTransfer.pending
+                and alchemyInventoryTransfer.changed
+                and alchemyInventoryTransfer.lastFingerprint
+                or nil,
+        }
+        local sent, response, err, requestPending, didInvoke = invokeAlchemyAction(
+            "ALCHEMY_CRAFT_RECIPE",
+            { recipeId = recipe.id },
+            recoverySnapshot
+        )
+        if requestPending then
+            alchemyTelemetry.remoteResult = nil
+            alchemyTelemetry.status = "brew request still pending"
+            alchemyTelemetry.lastError = err
+            return false, err
+        end
+        if not sent and alchemyRequestDidNotStart(err, didInvoke) then
+            alchemyTelemetry.craftAttempts = math.max(
+                0,
+                alchemyTelemetry.craftAttempts - 1
+            )
+            resetAlchemyRecovery()
+            if err == "Bag changed before Alchemy request" then
+                clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            end
+            alchemyTelemetry.status = err
+            alchemyTelemetry.lastError = nil
+            return false, err
+        end
+        local rejected, rejection = alchemyResponseRejected(response)
+        if sent and rejected then
+            sent = false
+            err = "server rejected recipe #" .. tostring(recipe.id)
+                .. ": " .. tostring(rejection)
+            alchemyTelemetry.remoteResult = response
+            if stagedRecipeId ~= nil then
+                clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            end
+        end
+        alchemyTelemetry.remoteResult = response
+        task.wait(0.4)
+        refreshAlchemyUi()
+        local confirmed, confirmation = false, err
+        if sent then
+            confirmed, confirmation = waitForAlchemyConfirmation(
+                alchemy,
+                "brew",
+                readyBefore
+            )
+        end
+        alchemyTelemetry.confirmed = confirmed
+        finishAlchemyRecipeAttempt(confirmed)
+        if confirmed then
+            clearAlchemyStageCandidate(alchemyInvokeLease.inventoryEpoch)
+            alchemyTelemetry.confirmedAction = "brew"
+            alchemyTelemetry.lastError = nil
+            alchemyTelemetry.status = "brew confirmed"
+        else
+            alchemyTelemetry.lastError = confirmation
+            alchemyTelemetry.status = "brew unconfirmed"
+        end
+        if confirmed then return true end
+        return false, confirmation
+    end
+
+    local function alchemyPriorityOutcome()
+        if alchemyTelemetry.confirmedAction == "brew" then return "brew" end
+        if alchemyTelemetry.confirmedAction == "pickup" and not cfg.AutoBrew then
+            return "pickup"
+        end
+        if alchemyTelemetry.inProgress == true
+            and alchemyTelemetry.status == "brewing (one potion at a time)"
+        then
+            return "brew"
+        end
+        if alchemyTelemetry.status == "potion ready for pickup"
+            and cfg.AutoPickupPotion ~= true
+        then
+            return "potion-ready"
+        end
+        if alchemyTelemetry.status == "no recipe candidate"
+            and alchemyTelemetry.checkTotal > 0
+            and alchemyTelemetry.craftable == 0
+            and alchemyTelemetry.predicateErrors == 0
+            and not alchemyInventoryTransferPending()
+        then
+            return "alchemy-empty"
+        end
+        if not cfg.AutoBrew and not cfg.AutoPickupPotion then
+            return "alchemy-disabled"
+        end
+        if not cfg.AutoBrew
+            and cfg.AutoPickupPotion
+            and alchemyTelemetry.status == "waiting for brewed potion"
+            and alchemyTelemetry.ready == false
+        then
+            return "alchemy-empty"
+        end
+        return nil
+    end
+
+    local function autoSellBaseGate()
+        if not sessionAlive then return false, "session closed", nil end
+        if not configReady then return false, "waiting for config", nil end
+        if not autoSellEnabled() then return false, "disabled", nil end
+        local challenge = playerNumber("InDungeonChallenge")
+        if challenge == nil then
+            return false, "waiting for dungeon state", nil
+        end
+        if challenge > 0 then return false, "waiting for base", challenge end
+        return true, nil, challenge
+    end
+
+    local function runAutoSellCycle(confirmedActionThisCycle)
+        local baseAllowed, baseStatus, challenge = autoSellBaseGate()
+        sellTelemetry.challenge = challenge
+        if not baseAllowed then
+            sellTelemetry.status = baseStatus
+            sellTelemetry.lastError = nil
+            return false, 0
+        end
+
+        local alchemySettled = confirmedActionThisCycle == "brew"
+            or confirmedActionThisCycle == "pickup"
+            or confirmedActionThisCycle == "alchemy-empty"
+            or confirmedActionThisCycle == "potion-ready"
+        sellTelemetry.brewInProgress = nil
+        sellTelemetry.authorization = cfg.AutoBrew and nil or "Auto Brew off"
+        if cfg.AutoBrew and not alchemySettled then
+            local alchemy, resolveError = resolveAlchemy()
+            if alchemy == nil then
+                sellTelemetry.status = "waiting for Alchemy"
+                sellTelemetry.lastError = resolveError
+                return false, 0, resolveError
+            end
+            local inProgress, progressError = alchemyState(
+                alchemy,
+                "IsBrewInProgress"
+            )
+            sellTelemetry.brewInProgress = inProgress
+            if inProgress ~= true then
+                sellTelemetry.status = inProgress == false
+                    and (confirmedActionThisCycle == "pickup"
+                        and "waiting for next brew"
+                        or "waiting for confirmed brew")
+                    or "waiting for brew state"
+                sellTelemetry.lastError = progressError
+                return false, 0, progressError
+            end
+            sellTelemetry.authorization = "already brewing"
+        elseif cfg.AutoBrew then
+            -- A craft can complete so quickly that replicated state moves
+            -- directly from idle to ready. A typed brew or pickup confirmation
+            -- from THIS worker tick proves the current Alchemy pass settled.
+            sellTelemetry.authorization = confirmedActionThisCycle
+        end
+
+        sellTelemetry.attempts += 1
+        sellTelemetry.status = "selling"
+        local sold, count, err = sellAllMaterials(automaticSellSelection(), function()
+            local brewStateValidated = alchemySettled
+            if cfg.AutoBrew and not alchemySettled then
+                -- A detached sell scan can overlap a running brew. Re-read the
+                -- authoritative state immediately before SELL so a stale
+                -- "already brewing" grant cannot sell ingredients after it ends.
+                local currentAlchemy = resolveAlchemy()
+                if currentAlchemy == nil then return false, "waiting for Alchemy" end
+                local currentProgress = alchemyState(
+                    currentAlchemy,
+                    "IsBrewInProgress"
+                )
+                if currentProgress ~= true then
+                    return false, "waiting for confirmed brew"
+                end
+                brewStateValidated = true
+            end
+
+            -- Keep the base/config/toggle read last: the Alchemy state helpers
+            -- above may yield while Broom, reload or the user changes state.
+            local stillAtBase, finalStatus, finalChallenge = autoSellBaseGate()
+            sellTelemetry.challenge = finalChallenge
+            if not stillAtBase then return false, finalStatus end
+            -- If AutoBrew switched on while the final gate yielded, the prior
+            -- AutoBrew-off decision is no longer a safe sell authorization.
+            if cfg.AutoBrew and not brewStateValidated then
+                return false, "waiting for confirmed brew"
+            end
+            return true
+        end)
+        sellTelemetry.lastCount = count or 0
+        sellTelemetry.lastError = err
+        if sold then
+            sellTelemetry.requests += 1
+            sellTelemetry.requestedItems += count or 0
+            sellTelemetry.status = "sell request sent"
+        elseif err == "nothing to sell" then
+            sellTelemetry.status = "nothing to sell"
+            sellTelemetry.lastError = nil
+        elseif err == "waiting for config"
+            or err == "session closed"
+            or err == "disabled"
+            or err == "waiting for dungeon state"
+            or err == "waiting for base"
+            or err == "waiting for confirmed brew"
+        then
+            sellTelemetry.status = err
+            sellTelemetry.lastError = nil
+        else
+            sellTelemetry.status = "sell failed"
+        end
+        return sold, count or 0, err
+    end
+
+    -- Attack -----------------------------------------------------------------
+
+    local attack = {
+        skillInput = nil,
+        slotIndex = nil,
+        status = "resolving",
+    }
+
+    -- Live combat telemetry: the Combat tab renders these so a silent
+    -- fail-open (missing skill module, missing remote) is always visible.
+    local combatStats = {
+        attacksOk = 0,
+        attacksFailed = 0,
+        clicksOk = 0,
+        clicksFailed = 0,
+        lastAttackError = "none",
+        lastClickError = "none",
+        clickDelivery = "none",
+        powerRequestsOk = 0,
+        powerRequestsFailed = 0,
+        lastPowerError = "none",
+    }
+
+    local function withElevatedIdentity(callback)
+        local getIdentity = getthreadidentity
+        local setIdentity = setthreadidentity
+        if type(getIdentity) == "function" and type(setIdentity) == "function" then
+            local ok, original = pcall(getIdentity)
+            if ok and type(original) == "number" then
+                -- The original resolver requires identity 2 specifically;
+                -- retaining a higher executor identity can make ModuleScripts
+                -- reject require() even though the path is correct.
+                pcall(setIdentity, 2)
+                local resultOk, result = pcall(callback)
+                pcall(setIdentity, original)
+                return resultOk, result
+            end
+        end
+        return pcall(callback)
+    end
+
+    local function resolveAttack()
+        if attack.skillInput ~= nil then
+            return attack.skillInput
+        end
+        local ok, result = withElevatedIdentity(function()
+            -- Match Magic's non-yielding resolver. Missing modules fail this
+            -- 0.2 s combat tick and are retried on the next one instead of
+            -- blocking Auto Attack inside chained eight-second waits.
+            local playerScripts = player:FindFirstChild("PlayerScripts")
+            if playerScripts == nil then return { error = "PlayerScripts not found" } end
+            local managerFolder = playerScripts:FindFirstChild("Manager")
+            if managerFolder == nil then return { error = "Manager not found" } end
+            local skillManager = managerFolder:FindFirstChild("PlayerSkillClientManager")
+            if skillManager == nil then return { error = "PlayerSkillClientManager not found" } end
+            local inputModule = skillManager:FindFirstChild("PlayerSkillInput")
+            if inputModule == nil then return { error = "PlayerSkillInput not found" } end
+            local configModule = skillManager:FindFirstChild("SkillSlotConfig")
+            if configModule == nil then return { error = "SkillSlotConfig not found" } end
+            local inputOk, inputTable = pcall(require, inputModule)
+            if not inputOk or type(inputTable) ~= "table" then
+                return { error = "PlayerSkillInput require failed" }
+            end
+            local configOk, configTable = pcall(require, configModule)
+            if not configOk or type(configTable) ~= "table" then
+                return { error = "SkillSlotConfig require failed" }
+            end
+            if type(inputTable.simulateSlotPressRelease) ~= "function" then
+                return { error = "simulateSlotPressRelease missing" }
+            end
+            if configTable.NORMAL_ATTACK_SLOT_INDEX == nil then
+                return { error = "NORMAL_ATTACK_SLOT_INDEX missing" }
+            end
+            return {
+                input = inputTable,
+                slot = configTable.NORMAL_ATTACK_SLOT_INDEX,
+            }
+        end)
+        if ok and type(result) == "table" and result.error == nil then
+            attack.skillInput = result.input
+            attack.slotIndex = result.slot
+            attack.status = "ready"
+            return attack.skillInput
+        end
+        attack.status = (ok and type(result) == "table" and result.error)
+            or "skill modules unavailable"
+        return nil
+    end
+
+    local function setNowTarget(target)
+        local value = player:FindFirstChild("NowTargetCurrent")
+        if value == nil then return false end
+        local ok = pcall(function() value.Value = target end)
+        return ok
+    end
+
+    local function findAttackTarget(range)
+        local parts = characterParts()
+        if parts == nil then return nil end
+        local best = nil
+        local bestDistance = nil
+        for _, folderName in ipairs({ "Monster", "LocalMonster" }) do
+            local folder = workspace:FindFirstChild(folderName)
+            if folder ~= nil then
+                for _, model in ipairs(folder:GetChildren()) do
+                    local ok, usable = pcall(function()
+                        if not model:IsA("Model") then return false end
+                        local humanoid = model:FindFirstChildOfClass("Humanoid")
+                        if humanoid ~= nil and humanoid.Health <= 0 then return false end
+                        local anchor = model.PrimaryPart
+                            or model:FindFirstChild("HumanoidRootPart")
+                        if anchor == nil then return false end
+                        return true
+                    end)
+                    if ok and usable then
+                        local anchor = model.PrimaryPart
+                            or model:FindFirstChild("HumanoidRootPart")
+                        local distance = (anchor.Position - parts.root.Position).Magnitude
+                        if distance < range and (bestDistance == nil or distance < bestDistance) then
+                            best = model
+                            bestDistance = distance
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function attackTarget(target, allowUntargeted)
+        local input = resolveAttack()
+        if input == nil then return false, attack.status end
+        if target ~= nil and not setNowTarget(target) then
+            if allowUntargeted ~= true then
+                return false, "NowTargetCurrent unavailable"
+            end
+        end
+        -- Match the game/original call context: only module resolution needs
+        -- identity 2; the actual input simulation runs at the caller identity.
+        local ok = pcall(
+            input.simulateSlotPressRelease,
+            attack.slotIndex,
+            true
+        )
+        if not ok then return false, "simulateSlotPressRelease failed" end
+        return true
+    end
+
+    -- Auto Click combines the power route confirmed from real world clicks
+    -- with the existing normal-attack route. The server calculates the
+    -- awarded power from the player's current weapon/rebirth state; no gain
+    -- is hard-coded here. Neither route injects mouse input or moves the
+    -- real cursor.
+    --
+    -- InvokeServer is yielding and cannot be cancelled safely. Keep exactly
+    -- one power request in flight so a slow response never freezes combat or
+    -- creates an unbounded pile of remote calls.
+    local powerClick = {
+        inFlight = false,
+    }
+
+    local function queuePowerClick()
+        if powerClick.inFlight then
+            return true, "power request pending"
+        end
+
+        powerClick.inFlight = true
+        local spawnOk, spawnError = pcall(task.spawn, function()
+            local callOk, sent, _, sendError = pcall(
+                invokeAction,
+                "TRAIN_MANUAL_CLICK",
+                {}
+            )
+            powerClick.inFlight = false
+            if callOk and sent then
+                combatStats.powerRequestsOk = combatStats.powerRequestsOk + 1
+                combatStats.lastPowerError = "none"
+            else
+                combatStats.powerRequestsFailed = combatStats.powerRequestsFailed + 1
+                combatStats.lastPowerError = tostring(
+                    callOk and sendError or sent or "power request failed"
+                )
+            end
+        end)
+        if not spawnOk then
+            powerClick.inFlight = false
+            combatStats.powerRequestsFailed = combatStats.powerRequestsFailed + 1
+            combatStats.lastPowerError = tostring(spawnError)
+            return false, "power queue failed: " .. tostring(spawnError)
+        end
+        return true, "power request queued"
+    end
+
+    local function performAutoClick()
+        if characterParts() == nil then return false, "character unavailable" end
+
+        local powerAccepted, powerDelivery = queuePowerClick()
+        local target = findAttackTarget(tonumber(cfg.AttackRange) or 120)
+        local attackOk, attackErr = attackTarget(target)
+
+        if powerAccepted and attackOk then
+            return true, powerDelivery .. " + normal attack"
+        end
+        if not powerAccepted and not attackOk then
+            return false, tostring(powerDelivery)
+                .. "; attack failed: " .. tostring(attackErr)
+        end
+        if not powerAccepted then
+            return false, tostring(powerDelivery)
+                .. "; normal attack sent"
+        end
+        -- Power is Auto Click's primary effect. A missing attack module is
+        -- reported in diagnostics but must not turn a successful power click
+        -- into a failed click.
+        return true, powerDelivery .. "; attack failed: " .. tostring(attackErr)
+    end
+
+    -- Locomotion bridge --------------------------------------------------------
+
+    local loco = nil
+    if type(locomotionFactory) == "table"
+        and type(locomotionFactory.create) == "function"
+    then
+        local ok, module = pcall(locomotionFactory.create, {
+            option = function(name, fallback)
+                if cfg[name] ~= nil then return cfg[name] end
+                return fallback
+            end,
+            toggle = function(name)
+                return cfg[name] == true
+            end,
+            notify = function(text)
+                notify(text)
+            end,
+            stagePart = function(stage)
+                return stagePart(stage)
+            end,
+            alive = function()
+                return sessionAlive
+            end,
+            broomGate = broomEconomyGate,
+            approachBroomGate = function()
+                return broomFarmRoute:ApproachGate()
+            end,
+            stopBroomApproach = function()
+                broomFarmRoute:StopGateApproach()
+            end,
+            onBroomStageEntered = function(stage)
+                local numeric = math.floor(tonumber(stage) or 0)
+                if numeric <= 0 then return end
+                broomFarmRoute.stage = numeric
+                broomFarmRoute.bypassEnterDelay = true
+            end,
+        })
+        if ok and type(module) == "table" then
+            loco = module
+        end
+    end
+
+    local lastFarmMode = nil
+
+    local function blocksPhysicalTransit()
+        if loco ~= nil
+            and (cfg.FarmMode == "Walking" or cfg.FarmMode == "Running")
+        then
+            local ok, blocked = pcall(function() return loco:BlocksAttack() end)
+            if ok and blocked then return true end
+        end
+        return false
+    end
+
+    local function blocksAttack()
+        return blocksPhysicalTransit()
+    end
+
+    local function stopMovementModes()
+        if loco ~= nil then
+            pcall(function() loco:StopWalking() end)
+        end
+    end
+
+    -- Return episode (inventory full) ------------------------------------------
+
+    local returnEpisode = {
+        active = false,
+        reason = nil,
+        requestedAt = 0,
+        fired = false,
+        lastChallenge = nil,
+        lastAttemptAt = 0,
+        lastError = nil,
+        attempts = 0,
+        broomArmed = false,
+    }
+    local function resetReturnEpisode()
+        returnEpisode.active = false
+        returnEpisode.reason = nil
+        returnEpisode.requestedAt = 0
+        returnEpisode.fired = false
+        returnEpisode.lastChallenge = nil
+        returnEpisode.lastAttemptAt = 0
+        returnEpisode.lastError = nil
+        returnEpisode.attempts = 0
+        returnEpisode.broomArmed = false
+    end
+
+    local function startReturnEpisode(reason)
+        if returnEpisode.active then
+            if reason == "event" and returnEpisode.reason ~= "event" then
+                returnEpisode.reason = "event"
+                notify("Dragon event detected; returning to base to sell")
+            end
+            return
+        end
+        returnEpisode.active = true
+        returnEpisode.reason = reason
+        returnEpisode.requestedAt = os.clock()
+        returnEpisode.fired = false
+        returnEpisode.lastAttemptAt = 0
+        returnEpisode.lastError = nil
+        returnEpisode.attempts = 0
+        returnEpisode.broomArmed = false
+        if reason == "event" then
+            notify("Dragon event detected; returning to base to sell")
+        else
+            notify("Inventory full; returning to base (" .. tostring(reason) .. ")")
+        end
+    end
+
+    local function updateReturnEpisode(full, eventReturnRequested)
+        local now = os.clock()
+        local challenge = playerNumber("InDungeonChallenge")
+        local eventReturn = eventReturnRequested == true
+        local bagReturn = cfg.AutoReturnFull == true and full == true
+
+        -- Bag and World Event share one confirmed return controller. The event
+        -- can request it independently of AutoReturnFull, but both paths keep
+        -- ReturnDelay, retry cadence and InDungeonChallenge confirmation.
+        if not (eventReturn or bagReturn)
+            or challenge == nil
+            or challenge <= 0
+        then
+            resetReturnEpisode()
+            return
+        end
+        returnEpisode.lastChallenge = challenge
+
+        if not returnEpisode.active then
+            startReturnEpisode(eventReturn and "event" or "bag")
+        elseif eventReturn then
+            startReturnEpisode("event")
+        end
+
+        if now - returnEpisode.requestedAt
+            < math.max(0, tonumber(cfg.ReturnDelay) or 0)
+        then
+            return
+        end
+        -- FireServer confirms only that the local facade accepted the call,
+        -- not that the server returned us. Match the original worker and retry
+        -- at most once every two seconds until InDungeonChallenge reaches 0.
+        -- Match Magic: retry every two seconds until replicated state confirms
+        -- that the player has reached base.
+        if now - returnEpisode.lastAttemptAt >= 2 then
+            if not returnEpisode.broomArmed and loco ~= nil then
+                local armedOk, armed = pcall(function()
+                    return loco:OnAutoReturnFull()
+                end)
+                returnEpisode.broomArmed = armedOk and armed ~= false
+            end
+            returnEpisode.lastAttemptAt = now
+            returnEpisode.attempts = returnEpisode.attempts + 1
+            local ok, err = sendAction("DUNGEON_RETURN_TOWN")
+            if ok then
+                returnEpisode.fired = true
+                returnEpisode.lastError = nil
+            else
+                returnEpisode.lastError = err or "return request failed"
+            end
+        end
+    end
+
+    -- Movement worker -----------------------------------------------------------
+
+    local movementStatus = "idle"
+    local dashboard = {}
+
+    local function setMovementStatus(text)
+        movementStatus = tostring(text)
+        pcall(function() dashboard.window:SetStatus(BRAND .. " • " .. movementStatus) end)
+    end
+
+    local enterDelay = {
+        stage = nil,
+        until_ = 0,
+    }
+
+    local function applyEnterDelay(stage, bypass)
+        if bypass == true then
+            enterDelay.stage = stage
+            enterDelay.until_ = 0
+            return true
+        end
+        if enterDelay.stage ~= stage then
+            enterDelay.stage = stage
+            enterDelay.until_ = os.clock() + math.max(0, tonumber(cfg.EnterDelay) or 0)
+        end
+        if os.clock() < enterDelay.until_ then
+            setMovementStatus(string.format(
+                "entering stage %d in %.1fs",
+                stage,
+                enterDelay.until_ - os.clock()
+            ))
+            return false
+        end
+        return true
+    end
+
+    local function nearestMonsterPosition(range, fallback)
+        local target = findAttackTarget(range)
+        if target ~= nil then
+            local anchor = target.PrimaryPart or target:FindFirstChild("HumanoidRootPart")
+            if anchor ~= nil then
+                return anchor.Position
+            end
+        end
+        return fallback
+    end
+
+    function worldEvent:FindOpenDoor()
+        local ok, tagged = pcall(function()
+            return CollectionService:GetTagged("RebirthLockDoor")
+        end)
+        if not ok or type(tagged) ~= "table" then return nil end
+
+        local reference = self.fallbackEntry
+        local best = nil
+        local bestDistance = nil
+        for _, candidate in ipairs(tagged) do
+            local valid, position = pcall(function()
+                if not candidate:IsA("BasePart") then return nil end
+                if not candidate:IsDescendantOf(workspace) then return nil end
+                return candidate.Position
+            end)
+            if valid and position ~= nil then
+                local dx = position.X - reference.X
+                local dz = position.Z - reference.Z
+                local distance = dx * dx + dz * dz
+                if bestDistance == nil or distance < bestDistance then
+                    best = candidate
+                    bestDistance = distance
+                end
+            end
+        end
+        return best
+    end
+
+    function worldEvent:EntryPosition(rootPosition)
+        local door = self:FindOpenDoor()
+        if door ~= nil then
+            local doorTarget = Vector3.new(
+                door.Position.X,
+                rootPosition.Y,
+                door.Position.Z
+            )
+            if self.entryStage ~= "interior" then
+                local dx = rootPosition.X - doorTarget.X
+                local dz = rootPosition.Z - doorTarget.Z
+                if dx * dx + dz * dz > 144 then
+                    self.entryStage = "door"
+                    self.entryTarget = doorTarget
+                    return doorTarget, "door"
+                end
+                self.entryStage = "interior"
+            end
+            self.entryTarget = self.fallbackEntry
+            return self.fallbackEntry, "interior"
+        end
+        self.entryStage = "closed"
+        self.entryTarget = nil
+        return nil, "closed"
+    end
+
+    function worldEvent:ActiveParticipantPosition()
+        for _, candidate in ipairs(Players:GetPlayers()) do
+            if candidate ~= player then
+                local combatFlag = candidate:FindFirstChild("InEventCombat")
+                local character = candidate.Character
+                local root = character and character:FindFirstChild("HumanoidRootPart")
+                local ok, combat = pcall(function()
+                    return combatFlag and tonumber(combatFlag.Value) or 0
+                end)
+                if ok and combat > 0 and root ~= nil then
+                    return Vector3.new(
+                        root.Position.X,
+                        self.fallbackEntry.Y,
+                        root.Position.Z
+                    )
+                end
+            end
+        end
+        return nil
+    end
+
+    function worldEvent:DragonBossUiActive()
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        local boss = playerGui and playerGui:FindFirstChild("BossHp", true)
+        if boss == nil then return false end
+        local visibleOk, visible = pcall(function() return boss.Visible end)
+        if not visibleOk or visible ~= true then return false end
+        local healthLabel = boss:FindFirstChild("Hp", true)
+        local healthOk, healthText = pcall(function()
+            return healthLabel and tostring(healthLabel.Text) or ""
+        end)
+        if not healthOk then return false end
+        local health = tonumber(string.match(healthText, "(%d+%.?%d*)")) or 0
+        return health > 0
+    end
+
+    function worldEvent:FindTarget()
+        for _, folderName in ipairs({ "Monster", "LocalMonster" }) do
+            local folder = workspace:FindFirstChild(folderName)
+            if folder ~= nil then
+                for _, model in ipairs(folder:GetChildren()) do
+                    local ok, eligible = pcall(function()
+                        if not model:IsA("Model") then return false end
+                        if model:GetAttribute("EventBattleEnemy") ~= true then return false end
+                        local humanoid = model:FindFirstChildOfClass("Humanoid")
+                        return humanoid == nil or humanoid.Health > 0
+                    end)
+                    if ok and eligible then return model end
+                end
+            end
+        end
+        return nil
+    end
+
+    function worldEvent:HasSpecialEnemyEvent()
+        for _, folderName in ipairs({ "Monster", "LocalMonster" }) do
+            local folder = workspace:FindFirstChild(folderName)
+            if folder ~= nil then
+                for _, model in ipairs(folder:GetChildren()) do
+                    local ok, special = pcall(function()
+                        if not model:IsA("Model") then return false end
+                        return model:GetAttribute("SpecialEnemyConfigId") ~= nil
+                            or model:GetAttribute("SpecialEnemyStageId") ~= nil
+                    end)
+                    if ok and special then return true end
+                end
+            end
+        end
+        return false
+    end
+
+    function worldEvent:UpdateMovement()
+        self:Sync()
+        local challenge = playerNumber("InDungeonChallenge")
+        if self:NeedsBaseReturn() then
+            if self.returnState ~= "returning" then
+                self.returnState = "returning"
+                self.returnEventId = self:AvailableId() or self:CurrentId()
+            end
+            stopMovementModes()
+            self.status = "returning from stage to sell before event"
+            setMovementStatus("World Event: returning to base to sell")
+            return false, true
+        end
+
+        if self.returnState == "returning"
+            and challenge ~= nil
+            and challenge <= 0
+        then
+            self.returnState = "base-economy"
+            self.status = "base confirmed; settling economy before event"
+        end
+
+        if not self:OwnsObjective() then return false, false end
+
+        local parts = characterParts()
+        if parts == nil then
+            stopMovementModes()
+            self.status = "waiting for character"
+            setMovementStatus("World Event: waiting for character")
+            return true, false
+        end
+
+        if self:BaseEconomyPending() then
+            if basePriority.phase ~= "broom" then
+                stopMovementModes()
+                pcall(function()
+                    parts.humanoid:Move(Vector3.zero, false)
+                    parts.humanoid:MoveTo(parts.root.Position)
+                end)
+                self.status = "waiting for base " .. tostring(basePriority.phase)
+                setMovementStatus("World Event: selling before entry • waiting for "
+                    .. tostring(basePriority.phase))
+                return true, false
+            end
+            self.returnState = "ready"
+            self.status = "base economy settled; walking to event"
+        end
+
+        if self.phase == "combat" then
+            if loco ~= nil then
+                local ok, status = pcall(function()
+                    return loco:UpdateEventRunning(parts.root, self.orbitCenter)
+                end)
+                if ok then
+                    self.status = "event combat; running around marked center"
+                    setMovementStatus("World Event: " .. tostring(status))
+                    return true, false
+                end
+            end
+            stopMovementModes()
+            pcall(function()
+                parts.humanoid:Move(Vector3.zero, false)
+                parts.humanoid:MoveTo(parts.root.Position)
+            end)
+            self.status = "event combat; fixed-center running unavailable"
+            setMovementStatus("World Event: fixed-center running unavailable")
+            return true, false
+        end
+
+        if self.phase == "prewait" then
+            stopMovementModes()
+            pcall(function()
+                parts.humanoid:Move(Vector3.zero, false)
+                parts.humanoid:MoveTo(parts.root.Position)
+            end)
+            self.status = "event begins in 10s; waiting at base"
+            setMovementStatus("World Event: waiting for start")
+            return true, false
+        end
+
+        local target, route = self:EntryPosition(parts.root.Position)
+        if target == nil then
+            stopMovementModes()
+            pcall(function()
+                parts.humanoid:Move(Vector3.zero, false)
+                parts.humanoid:MoveTo(parts.root.Position)
+            end)
+            self.status = "event door closed"
+            setMovementStatus("World Event: door closed")
+            return true, false
+        end
+
+        local moved = false
+        local moveStatus = nil
+        local moveError = nil
+        if loco ~= nil and type(loco.UpdateEventApproach) == "function" then
+            local callOk, approachOk, approachStatus = pcall(function()
+                return loco:UpdateEventApproach(parts.root, target)
+            end)
+            moved = callOk and approachOk == true
+            moveStatus = approachStatus
+            if not moved then
+                moveError = callOk and approachStatus or approachOk
+            end
+        else
+            moveError = "event locomotion unavailable"
+        end
+
+        -- Degraded compatibility only. The render-step controller above is
+        -- authoritative because live evidence showed MoveTo alone can be
+        -- overwritten while the player is at base.
+        if not moved then
+            stopMovementModes()
+            local fallbackOk, fallbackError = pcall(function()
+                parts.humanoid:MoveTo(target)
+            end)
+            moved = fallbackOk
+            moveStatus = fallbackOk and "MoveTo fallback" or nil
+            moveError = fallbackOk and moveError or fallbackError
+        end
+
+        self.lastError = moved and nil or tostring(moveError)
+        if moved then
+            self.status = route == "door" and "walking to open event door"
+                or route == "interior" and "crossing event door"
+                or "waiting for event door"
+        else
+            self.status = "event walk failed"
+        end
+        setMovementStatus(moved
+            and ("World Event: " .. self.status .. " • " .. tostring(moveStatus))
+            or ("World Event: movement failed: " .. tostring(moveError)))
+        return true, false
+    end
+
+    local function updateMovement()
+        if cfg.FarmMode ~= lastFarmMode then
+            if lastFarmMode == "Walking" or lastFarmMode == "Running" then
+                stopMovementModes()
+            end
+            lastFarmMode = cfg.FarmMode
+            enterDelay.stage = nil
+        end
+
+        -- World Event preempts the whole normal objective chain. Its toggle
+        -- never modifies the saved Farm/Broom/Training choices, so the base
+        -- sequence can resume unchanged after the server expels the player.
+        local eventHandled, eventReturnRequested = worldEvent:UpdateMovement()
+        local full = false
+        if not eventHandled or eventReturnRequested then
+            full = bagFull()
+        end
+        updateReturnEpisode(full, eventReturnRequested)
+
+        if returnEpisode.active then
+            enterDelay.stage = nil
+            stopMovementModes()
+            setMovementStatus(returnEpisode.reason == "event"
+                and "World Event: returning to base to sell"
+                or "inventory full; returning to base")
+            return
+        end
+
+        if eventHandled then
+            enterDelay.stage = nil
+            return
+        end
+
+        if not (cfg.AutoFarm or cfg.AutoFarmSpecific) then
+            if movementStatus ~= "idle" then
+                stopMovementModes()
+                setMovementStatus("idle")
+            end
+            return
+        end
+
+        local objectiveAllowed, objectiveStatus = farmObjectiveGate()
+        if not objectiveAllowed then
+            -- Do not prepare a route while Alchemy/Sell own the base. Reset
+            -- both implementations so EnterDelay starts from its full
+            -- configured value only after the next objective is released.
+            stopMovementModes()
+            enterDelay.stage = nil
+            setMovementStatus(objectiveStatus)
+            return
+        end
+
+        local cleared = playerNumber("DungeonRunMaxClear") or 0
+        local stage = Common.farmStageTarget(
+            cleared,
+            cfg.FarmStage,
+            cfg.AutoFarmSpecific == true,
+            MAX_FARM_STAGE
+        )
+        local releaseBroomRoute
+        stage, releaseBroomRoute = Common.broomFarmStageTarget(
+            stage,
+            broomFarmRoute.stage,
+            cfg.AutoFarm == true and cfg.AutoFarmSpecific ~= true
+        )
+        if releaseBroomRoute then
+            broomFarmRoute.stage = nil
+            broomFarmRoute.bypassEnterDelay = false
+        end
+
+        local mode = cfg.FarmMode
+        local bypassEnterDelay = broomFarmRoute.bypassEnterDelay == true
+
+        local stagePartInstance = stagePart(stage)
+        if stagePartInstance == nil then
+            stopMovementModes()
+            setMovementStatus("stage " .. stage .. " not loaded")
+            return
+        end
+
+        local parts = characterParts()
+        if parts == nil then
+            if mode == "Walking" or mode == "Running" then
+                stopMovementModes()
+            end
+            setMovementStatus("waiting for character")
+            return
+        end
+
+        if mode == "Walking" or mode == "Running" then
+            if loco == nil then
+                setMovementStatus(mode .. " module unavailable")
+                return
+            end
+            local ok, status = pcall(function()
+                return loco:Update(
+                    mode,
+                    stage,
+                    stagePartInstance,
+                    parts.root,
+                    groundPoint(stagePartInstance),
+                    bypassEnterDelay
+                )
+            end)
+            if ok then
+                setMovementStatus(status or string.lower(mode))
+            else
+                setMovementStatus(string.lower(mode) .. " error: " .. tostring(status))
+            end
+            return
+        end
+
+        -- Teleport-based modes below this point.
+        if mode == "Ground" then
+            if not applyEnterDelay(stage, bypassEnterDelay) then return end
+            if isOverFootprint(stagePartInstance, parts.root.Position) then
+                setMovementStatus("stage " .. stage .. " farming")
+                return
+            end
+            parts.root.CFrame = CFrame.new(groundPoint(stagePartInstance))
+            setMovementStatus("stage " .. stage .. " farming")
+            return
+        end
+
+        if mode == "Above" then
+            if not applyEnterDelay(stage, bypassEnterDelay) then return end
+            local center = nearestMonsterPosition(tonumber(cfg.AttackRange) or 120, groundPoint(stagePartInstance))
+            parts.root.CFrame = CFrame.new(center + Vector3.new(0, tonumber(cfg.FarmHeight) or 20, 0))
+            setMovementStatus("stage " .. stage .. " farming above")
+            return
+        end
+
+        if mode == "Orbit" then
+            if not applyEnterDelay(stage, bypassEnterDelay) then return end
+            local center = nearestMonsterPosition(tonumber(cfg.AttackRange) or 120, groundPoint(stagePartInstance))
+            local height = tonumber(cfg.FarmHeight) or 20
+            local radius = tonumber(cfg.OrbitRadius) or 25
+            local speed = tonumber(cfg.OrbitSpeed) or 1.5
+            local angle = os.clock() * speed
+            local position = center
+                + Vector3.new(math.cos(angle) * radius, height, math.sin(angle) * radius)
+            local lookAt = Vector3.new(center.X, position.Y, center.Z)
+            parts.root.CFrame = CFrame.lookAt(position, lookAt)
+            setMovementStatus("stage " .. stage .. " orbiting")
+            return
+        end
+
+        setMovementStatus("unknown farm mode " .. tostring(mode))
+    end
+
+    -- Combat workers -------------------------------------------------------------
+
+    task.spawn(function()
+        while sessionAlive do
+            local farming = cfg.AutoFarm or cfg.AutoFarmSpecific
+            local eventCombat = cfg.AutoWorldEvent == true
+                and worldEvent:CombatValue() > 0
+            local normalCombat = not worldEvent:OwnsObjective()
+                and farming
+                and cfg.AutoAttack
+            if (eventCombat or normalCombat) and not blocksAttack() then
+                -- Event enemies are selected by their replicated attribute,
+                -- never by dragon name or range. Auto World Event is therefore
+                -- self-contained even if normal Auto Attack is disabled.
+                local target = eventCombat and worldEvent:FindTarget()
+                    or findAttackTarget(tonumber(cfg.AttackRange) or 120)
+                if target ~= nil then
+                    local ok, err = attackTarget(target, eventCombat)
+                    if ok then
+                        combatStats.attacksOk = combatStats.attacksOk + 1
+                        combatStats.lastAttackError = "none"
+                    else
+                        combatStats.attacksFailed = combatStats.attacksFailed + 1
+                        combatStats.lastAttackError = tostring(err or "attack failed")
+                    end
+                end
+            end
+            task.wait(0.2)
+        end
+    end)
+
+    task.spawn(function()
+        while sessionAlive do
+            if cfg.AutoClick and not blocksPhysicalTransit() then
+                local clicked, delivery = performAutoClick()
+                if clicked then
+                    combatStats.clicksOk = combatStats.clicksOk + 1
+                    combatStats.lastClickError = "none"
+                    combatStats.clickDelivery = delivery
+                else
+                    combatStats.clicksFailed = combatStats.clicksFailed + 1
+                    combatStats.lastClickError = tostring(delivery)
+                    combatStats.clickDelivery = "none"
+                end
+            end
+            task.wait(1 / math.max(1, tonumber(cfg.ClickRate) or 10))
+        end
+    end)
+
+    -- Pickup worker -----------------------------------------------------------------
+
+    local dropsClient = workspace:FindFirstChild("DropsClient")
+
+    local function resolveDropsClient()
+        if dropsClient ~= nil and dropsClient.Parent ~= nil then
+            return dropsClient
+        end
+        dropsClient = workspace:FindFirstChild("DropsClient")
+        return dropsClient
+    end
+
+    local function pickupPrompt(primaryPart)
+        if primaryPart == nil then return nil end
+        local prompt = primaryPart:FindFirstChild("PickupPrompt")
+        if prompt ~= nil and prompt:IsA("ProximityPrompt") then
+            return prompt
+        end
+        return nil
+    end
+
+    local function promptDropId(prompt)
+        if type(getconnections) ~= "function" or type(getupvalue) ~= "function" then
+            return nil
+        end
+        local ok, connections = pcall(getconnections, prompt.Triggered)
+        if not ok or type(connections) ~= "table" then return nil end
+        for _, connection in ipairs(connections) do
+            local callbackOk, callback = pcall(function()
+                return connection.Function or connection.fn
+            end)
+            if callbackOk and type(callback) == "function" then
+                for index = 1, 8 do
+                    local readOk, value = pcall(getupvalue, callback, index)
+                    if readOk and type(value) == "string" and value ~= "" then
+                        return value
+                    end
+                end
+            end
+        end
+        return nil
+    end
+
+    local function activatePrompt(prompt, maxDistance)
+        pcall(function()
+            prompt.HoldDuration = 0
+            prompt.MaxActivationDistance = math.max(
+                tonumber(prompt.MaxActivationDistance) or 0,
+                tonumber(maxDistance) or 0
+            )
+        end)
+        if type(fireproximityprompt) == "function" then
+            local ok = pcall(fireproximityprompt, prompt, 0)
+            if ok then return true end
+        end
+        if type(firesignal) == "function" then
+            local ok = pcall(firesignal, prompt.Triggered, player)
+            if ok then return true end
+        end
+        local dropId = promptDropId(prompt)
+        if dropId ~= nil then
+            return sendAction("DROP_PICKUP", dropId)
+        end
+        return false
+    end
+
+    local pickupCount = 0
+    local dropsNearby = 0
+
+    local function activateSortedDrops(sorted, minValue, selectedItemIds)
+        local activatedCount = 0
+        for _, entry in ipairs(sorted) do
+            if Common.gateDrop(entry, {
+                minValue = minValue,
+                filterItems = cfg.PickupFilterItems == true,
+                itemIds = selectedItemIds,
+            }) then
+                local prompt = pickupPrompt(entry.primaryPart)
+                if prompt ~= nil and activatePrompt(prompt, cfg.PickupRange) then
+                    activatedCount = activatedCount + 1
+                end
+            end
+        end
+        return activatedCount
+    end
+
+    local function collectDrops()
+        local container = resolveDropsClient()
+        if container == nil then return end
+        local parts = characterParts()
+        if parts == nil then return end
+
+        local range = tonumber(cfg.PickupRange) or 150
+        local minValue = tonumber(cfg.PickupMinValue) or 0
+        local selectedItemIds = Common.parseIdSelection(cfg.PickupItems)
+
+        local candidates = {}
+        local order = 0
+        for _, model in ipairs(container:GetDescendants()) do
+            local ok, entry = pcall(function()
+                if not model:IsA("Model") then return nil end
+                local legacy = model.Name == "DropItem"
+                local itemId = tonumber(model:GetAttribute("ItemId"))
+                if not legacy and itemId == nil then return nil end
+                local primaryPart = model.PrimaryPart
+                if primaryPart == nil then return nil end
+                local rawGold = model:GetAttribute("GoldValue")
+                local gold = math.floor(tonumber(rawGold) or 0)
+                local landed = model:GetAttribute("DropLanded") == true
+                local tier = tonumber(model:GetAttribute("Xyd"))
+                    or tonumber(model.Parent and model.Parent.Name)
+                    or nil
+                local distance = (primaryPart.Position - parts.root.Position).Magnitude
+                return {
+                    model = model,
+                    primaryPart = primaryPart,
+                    itemId = itemId,
+                    rawGold = rawGold,
+                    gold = gold,
+                    tier = tier,
+                    landed = landed,
+                    distance = distance,
+                    order = order,
+                }
+            end)
+            if ok and entry ~= nil then
+                order = order + 1
+                entry.order = order
+                entry.hasPrimaryPart = entry.primaryPart ~= nil
+                entry.inRange = entry.distance <= range
+                entry.isEvent = Common.isEventDrop(entry.rawGold)
+                table.insert(candidates, entry)
+            end
+        end
+
+        dropsNearby = 0
+        for _, entry in ipairs(candidates) do
+            if entry.inRange then dropsNearby = dropsNearby + 1 end
+        end
+
+        local sorted = Common.sortDrops(candidates)
+        pickupCount = pickupCount
+            + activateSortedDrops(sorted, minValue, selectedItemIds)
+    end
+
+    task.spawn(function()
+        while sessionAlive do
+            local eventCombat = cfg.AutoWorldEvent == true
+                and worldEvent:CombatValue() > 0
+            if cfg.AutoPickup or eventCombat then
+                local ok, err = pcall(collectDrops)
+                if not ok then
+                    -- transient scan failure; retry on the next tick
+                end
+            end
+            task.wait(0.4)
+        end
+    end)
+
+    -- Progress workers -----------------------------------------------------------------
+
+    local function canEnterTrainGround(trainId)
+        local data = resolveGetData()
+        local train = data and data.Train
+        if type(train) ~= "table"
+            or type(train.CanEnterTrainGround) ~= "function"
+        then
+            return false
+        end
+        local ok, result = pcall(
+            train.CanEnterTrainGround,
+            player,
+            trainId
+        )
+        if not ok then return false end
+        if type(result) == "table" then return result.ok == true end
+        return result == true
+    end
+
+    local function selectedTrainGroundId()
+        local selected = tostring(cfg.TrainGround or "Best available")
+        local explicit = tonumber(selected)
+            or tonumber(string.match(selected, "^#?(%d+)"))
+        if explicit ~= nil then
+            -- Magic trusts an explicit user selection and lets the zone/remote
+            -- provide the real acceptance signal. Its CanEnter predicate is
+            -- used only to choose Best available.
+            return math.floor(explicit)
+        end
+
+        local ids = {}
+        for _, entry in ipairs(catalogByName("trainConf")) do
+            table.insert(ids, entry.id)
+        end
+        table.sort(ids)
+        for _, trainId in ipairs(ids) do
+            if canEnterTrainGround(trainId) then return trainId end
+        end
+        return nil
+    end
+
+    local function trainGroundPart(trainId)
+        local data = resolveGetData()
+        local candidates = {}
+        for _, candidate in pairs({
+            data and data.Train,
+            resolveRuntimeModule("Train"),
+            resolveRuntimeModule("CfgFind"),
+        }) do
+            if candidate ~= nil then table.insert(candidates, candidate) end
+        end
+        for _, candidate in ipairs(candidates) do
+            if type(candidate) == "table"
+                and type(candidate.FindZonePartByTrainId) == "function"
+            then
+                local ok, part = pcall(
+                    candidate.FindZonePartByTrainId,
+                    trainId
+                )
+                if (not ok or part == nil) and data ~= nil then
+                    ok, part = pcall(
+                        candidate.FindZonePartByTrainId,
+                        player,
+                        trainId
+                    )
+                end
+                if ok and typeof(part) == "Instance" then
+                    if part:IsA("BasePart") then return part end
+                    local nested = part:FindFirstChildWhichIsA("BasePart", true)
+                    if nested ~= nil then return nested end
+                end
+            end
+        end
+        return nil
+    end
+
+    local potionDrinkCooldown = {}
+
+    local function drinkSelectedPotions()
+        local selectedIds = Common.parseIdSelection(cfg.DrinkPotions)
+        if next(selectedIds) == nil then return 0, "no potions selected" end
+        local bag, bagError = playerBag()
+        if bag == nil then return 0, bagError end
+        local onlyIds = Common.selectedOnlyIds(bag, selectedIds)
+        local sentCount = 0
+        for _, onlyId in ipairs(onlyIds) do
+            if not sessionAlive or not cfg.AutoDrinkPotion then break end
+            local now = os.clock()
+            if now - (potionDrinkCooldown[onlyId] or 0) >= 1.5 then
+                potionDrinkCooldown[onlyId] = now
+                local sent = invokeAction("DRINK_POTION", { onlyID = onlyId })
+                if sent then sentCount += 1 end
+                task.wait(0.6)
+            end
+        end
+        return sentCount
+    end
+
+    local gearKinds = {
+        {
+            config = "weaponConf",
+            itemType = 9,
+            equippedKey = "Wand",
+            buyToggle = "AutoBuyWand",
+            equipToggle = "AutoEquipWand",
+        },
+        {
+            config = "armorConf",
+            itemType = 13,
+            equippedKey = "Armor",
+            buyToggle = "AutoBuyArmor",
+            equipToggle = "AutoEquipArmor",
+        },
+    }
+
+    local function runGearKind(kind)
+        local entries = catalogByName(kind.config, kind.itemType)
+        if #entries == 0 then return false end
+        local bag = playerBag()
+        if type(bag) ~= "table" then return false end
+        local owned = Common.ownedItemIds(bag, kind.itemType)
+        local gold = playerGold() or 0
+        local buyEnabled = cfg.AutoBuyBest or cfg[kind.buyToggle]
+        local equipEnabled = cfg.AutoEquipBest or cfg[kind.equipToggle]
+
+        if buyEnabled then
+            for _, entry in ipairs(entries) do
+                if entry.price > 0
+                    and entry.price <= gold
+                    and owned[entry.id] ~= true
+                then
+                    invokeAction("EQUIP_SHOP_BUY", {
+                        equipID = entry.id,
+                        itemType = kind.itemType,
+                    })
+                    task.wait(0.4)
+                    break
+                end
+            end
+        end
+
+        if equipEnabled then
+            bag = playerBag()
+            owned = Common.ownedItemIds(bag, kind.itemType)
+            local current = math.floor(
+                tonumber(playerNumber(kind.equippedKey)) or 0
+            )
+            for _, entry in ipairs(entries) do
+                if owned[entry.id] == true then
+                    if current ~= entry.id then
+                        invokeAction("EQUIP_SHOP_EQUIP", {
+                            equipID = entry.id,
+                            itemType = kind.itemType,
+                        })
+                        task.wait(0.4)
+                    end
+                    break
+                end
+            end
+        end
+        return true
+    end
+
+    local function playerLevel()
+        local leaderstats = player:FindFirstChild("leaderstats")
+        local level = leaderstats and leaderstats:FindFirstChild("Level")
+        local value = level and tonumber(level.Value)
+        return value and math.floor(value) or 0
+    end
+
+    local function nextRebirthLevelRequirement()
+        local config = configByName("rebirthConf")
+        if type(config) ~= "table" then return nil end
+        local nextRebirth = math.floor((playerNumber("Rebirths") or 0) + 1)
+        local row = config[tostring(nextRebirth)] or config[nextRebirth]
+        if type(row) ~= "table" then return nil end
+        local requirement = tonumber(row.LvNeed)
+        return requirement and math.floor(requirement) or nil
+    end
+
+    local function runRebirthCycle()
+        if not cfg.AutoRebirth then return false end
+        local rebirths = playerNumber("Rebirths") or 0
+        local limit = math.floor(tonumber(cfg.RebirthLimit) or 41)
+        local levelRequirement = nextRebirthLevelRequirement()
+        if rebirths >= limit
+            or levelRequirement == nil
+            or playerLevel() < levelRequirement
+        then
+            return false
+        end
+        return invokeAction("PLAYER_REBIRTH")
+    end
+
+    task.spawn(function() -- rebirth
+        while sessionAlive do
+            if not worldEvent:OwnsObjective() then runRebirthCycle() end
+            task.wait(3)
+        end
+    end)
+
+    task.spawn(function() -- train
+        while sessionAlive do
+            local trainPriorityAllowed = farmObjectiveGate()
+            if cfg.AutoTrain and trainPriorityAllowed then
+                local trainId = selectedTrainGroundId()
+                if trainId ~= nil and trainId > 0 then
+                    local ground = trainGroundPart(trainId)
+                    local parts = characterParts()
+                    if ground ~= nil and parts ~= nil
+                        and not isOverFootprint(ground, parts.root.Position)
+                    then
+                        parts.root.CFrame = CFrame.new(
+                            ground.Position
+                                + Vector3.new(0, ground.Size.Y * 0.5 + 3, 0)
+                        )
+                        task.wait(0.3)
+                    end
+                    if playerNumber("TrainGroundId") ~= trainId then
+                        sendAction("TRAIN_ZONE_UPDATE", { trainId = trainId })
+                        task.wait(0.2)
+                    end
+                    invokeAction("TRAIN_MANUAL_CLICK", {})
+                end
+            end
+            task.wait(0.2)
+        end
+    end)
+
+    task.spawn(function() -- index claims
+        while sessionAlive do
+            if cfg.AutoClaimIndex then
+                claimIndexRewards()
+            end
+            task.wait(4)
+        end
+    end)
+
+    task.spawn(function() -- online claims
+        while sessionAlive do
+            if cfg.AutoClaimOnline then
+                claimOnlineAwards()
+            end
+            task.wait(2)
+        end
+    end)
+
+    task.spawn(function() -- event claims
+        while sessionAlive do
+            if cfg.AutoClaimEvent then
+                eventClaims.claim()
+            end
+            task.wait(2)
+        end
+    end)
+
+    task.spawn(function() -- potions
+        while sessionAlive do
+            if cfg.AutoDrinkPotion then
+                drinkSelectedPotions()
+            end
+            task.wait(1)
+        end
+    end)
+
+    task.spawn(function() -- alchemy
+        local nextAutoSellAt = 0
+        local nextIdleBrewCheckAt = 0
+        local IDLE_BREW_READY_POLL_SECONDS = 1
+        local autoSellCyclePending = false
+        local autoSellCycleGeneration = 0
+        local lastObservedChallenge = nil
+        local lastPriorityConfig = nil
+
+        local function priorityConfigKey()
+            return table.concat({
+                tostring(cfg.AutoBrew),
+                tostring(cfg.AutoPickupPotion),
+                tostring(cfg.BrewRecipe),
+                tostring(cfg.AutoSell),
+                tostring(cfg.AutoSellSpecific),
+                tostring(cfg.SellItems),
+            }, "|")
+        end
+
+        local function idleBaseAlchemyEnabled()
+            return cfg.AutoBrew == true
+                and cfg.AutoPickupPotion == true
+                and not worldEvent:OwnsObjective()
+                and cfg.AutoBroom ~= true
+                and cfg.AutoFarm ~= true
+                and cfg.AutoFarmSpecific ~= true
+        end
+
+        local function rearmIdleAlchemyIfReady(observedChallenge)
+            if observedChallenge == nil
+                or observedChallenge > 0
+                or basePriority.phase ~= "broom"
+                or not idleBaseAlchemyEnabled()
+            then
+                nextIdleBrewCheckAt = 0
+                return false
+            end
+            if alchemyTelemetry.ready == true then
+                alchemyTelemetry.inProgress = false
+                resetBasePriority("idle brewed potion ready")
+                nextAutoSellAt = 0
+                nextIdleBrewCheckAt = 0
+                return true
+            end
+            if alchemyTelemetry.inProgress ~= true then
+                nextIdleBrewCheckAt = 0
+                return false
+            end
+            local now = os.clock()
+            if now < nextIdleBrewCheckAt then return false end
+            nextIdleBrewCheckAt = now + IDLE_BREW_READY_POLL_SECONDS
+            local alchemy = resolveAlchemy()
+            if alchemy == nil then return false end
+            local ready = alchemyState(alchemy, "IsBrewReadyForPickup")
+            if ready ~= nil then alchemyTelemetry.ready = ready end
+            if ready ~= true then return false end
+            alchemyTelemetry.inProgress = false
+            resetBasePriority("idle brewed potion ready")
+            nextAutoSellAt = 0
+            nextIdleBrewCheckAt = 0
+            return true
+        end
+
+        local function startAutoSellCycle(confirmedAction, priorityGeneration)
+            if autoSellCyclePending then return false end
+            autoSellCyclePending = true
+            autoSellCycleGeneration += 1
+            local token = autoSellCycleGeneration
+            local priorityConfig = priorityConfigKey()
+            local started, spawnError = pcall(task.spawn, function()
+                local ok, sold, _, err = pcall(
+                    runAutoSellCycle,
+                    confirmedAction
+                )
+                if autoSellCycleGeneration ~= token then return end
+                autoSellCyclePending = false
+                if basePriority.generation ~= priorityGeneration
+                    or basePriority.phase ~= "sell"
+                    or priorityConfigKey() ~= priorityConfig
+                then
+                    return
+                end
+                if not ok and sessionAlive then
+                    sellTelemetry.status = "sell error"
+                    sellTelemetry.lastError = tostring(sold)
+                    nextAutoSellAt = os.clock() + 2
+                elseif not autoSellEnabled() then
+                    setBasePriorityPhase("broom", "sell disabled")
+                    nextAutoSellAt = 0
+                elseif err == "nothing to sell" then
+                    -- A post-sale rescan is the confirmation: Broom is released
+                    -- only when no currently selected item remains sellable.
+                    setBasePriorityPhase("broom", "nothing left to sell")
+                    nextAutoSellAt = 0
+                else
+                    -- A successful transport is not inventory confirmation.
+                    -- Wait for replication, then scan again before Broom.
+                    nextAutoSellAt = os.clock() + 2
+                end
+            end)
+            if not started and autoSellCycleGeneration == token then
+                autoSellCyclePending = false
+                sellTelemetry.status = "sell error"
+                sellTelemetry.lastError = tostring(spawnError)
+                nextAutoSellAt = os.clock() + 2
+            end
+            return started
+        end
+        while sessionAlive do
+            -- Keep the inventory epoch current even while both Alchemy
+            -- toggles are off. A late request must never resurrect a frozen
+            -- pre-dungeon recipe order after the player collects new items.
+            local observedChallenge = playerNumber("InDungeonChallenge")
+            if observedChallenge ~= nil then
+                observeAlchemyLocation(observedChallenge)
+                if observedChallenge > 0 then
+                    if lastObservedChallenge == nil or lastObservedChallenge <= 0 then
+                        resetBasePriority("dungeon active")
+                        nextAutoSellAt = 0
+                    end
+                    resetAlchemyRecovery()
+                elseif lastObservedChallenge ~= nil and lastObservedChallenge > 0 then
+                    resetBasePriority("returned to base")
+                    nextAutoSellAt = 0
+                end
+                lastObservedChallenge = observedChallenge
+            end
+
+            local currentPriorityConfig = priorityConfigKey()
+            if configReady
+                and lastPriorityConfig ~= nil
+                and currentPriorityConfig ~= lastPriorityConfig
+            then
+                resetBasePriority("economy config changed")
+                nextAutoSellAt = 0
+            end
+            lastPriorityConfig = currentPriorityConfig
+
+            if configReady and not cfg.AutoBrew then
+                clearAlchemyStageCandidate()
+            end
+
+            if not configReady then
+                setBasePriorityPhase("alchemy", "waiting for config")
+                sellTelemetry.status = "waiting for config"
+                sellTelemetry.lastError = nil
+                nextAutoSellAt = 0
+            elseif worldEvent:OwnsObjective()
+                and not worldEvent:BaseEconomyPending()
+            then
+                -- Preserve the current Alchemy/Sell phase without starting a
+                -- new base action. World Event owns the player until the game
+                -- itself clears InEventCombat and returns them to the lobby.
+            elseif observedChallenge == nil then
+                setBasePriorityPhase("alchemy", "waiting for dungeon state")
+            elseif observedChallenge > 0 then
+                setBasePriorityPhase("alchemy", "collecting in dungeon")
+            elseif basePriority.phase == "alchemy" then
+                local ok, err = pcall(runAlchemyCycle)
+                if not ok then
+                    alchemyTelemetry.status = "alchemy error"
+                    alchemyTelemetry.lastError = tostring(err)
+                else
+                    local outcome = alchemyPriorityOutcome()
+                    if outcome ~= nil then
+                        basePriority.alchemyOutcome = outcome
+                        setBasePriorityPhase("sell", "Alchemy settled: " .. outcome)
+                        nextAutoSellAt = 0
+                    end
+                end
+            elseif basePriority.phase == "sell" then
+                if not autoSellEnabled() then
+                    sellTelemetry.status = "disabled"
+                    sellTelemetry.lastError = nil
+                    setBasePriorityPhase("broom", "sell disabled")
+                    nextAutoSellAt = 0
+                elseif not autoSellCyclePending and os.clock() >= nextAutoSellAt then
+                    startAutoSellCycle(
+                        basePriority.alchemyOutcome,
+                        basePriority.generation
+                    )
+                end
+            end
+
+            -- If no travel objective owns the base, keep only one cheap
+            -- readiness watch alive for the confirmed brew. Once it finishes,
+            -- restart Alchemy so pickup -> Best repeats until the material scan
+            -- proves that no replacement recipe exists.
+            rearmIdleAlchemyIfReady(observedChallenge)
+
+            -- Alchemy owns the fastest cadence. Sell and Broom cannot advance
+            -- until the preceding phase has produced a terminal outcome.
+            if configReady
+                and observedChallenge ~= nil
+                and (observedChallenge > 0
+                    or alchemyInventoryTransferPending()
+                    or (basePriority.phase == "alchemy" and cfg.AutoBrew)
+                    or alchemyTelemetry.status == "syncing dungeon materials")
+            then
+                task.wait(0.1)
+            else
+                task.wait(0.5)
+            end
+        end
+    end)
+
+    task.spawn(function() -- gear
+        while sessionAlive do
+            local enabled = cfg.AutoBuyBest
+                or cfg.AutoEquipBest
+                or cfg.AutoBuyWand
+                or cfg.AutoEquipWand
+                or cfg.AutoBuyArmor
+                or cfg.AutoEquipArmor
+            if enabled then
+                for _, kind in ipairs(gearKinds) do runGearKind(kind) end
+            end
+
+            task.wait(2)
+        end
+    end)
+
+    -- Anti-AFK -----------------------------------------------------------------------
+
+    local idleConnections = {}
+    local function setAntiAfk(enabled)
+        for _, connection in ipairs(idleConnections) do
+            pcall(function()
+                if enabled then
+                    connection:Disable()
+                elseif type(connection.Enable) == "function" then
+                    connection:Enable()
+                end
+            end)
+        end
+    end
+    pcall(function()
+        if type(getconnections) == "function" then
+            idleConnections = getconnections(player.Idled)
+        end
+    end)
+    setAntiAfk(cfg.AntiAfk)
+
+    -- Dashboard -----------------------------------------------------------------------
+
+    local window = Library:CreateWindow({
+        Title = BRAND,
+        SubTitle = "Magic Loot suite • " .. Library.Version,
+    })
+    dashboard.window = window
+
+    unloadSession = function(reason)
+        if unloaded then return end
+        unloaded = true
+        sessionAlive = false
+        configReady = false
+        resetAlchemyRecovery()
+        if loco ~= nil then
+            pcall(function() loco:Stop() end)
+        end
+        for _, gui in pairs({ floatingGui, emergencyGui, bannerGui }) do
+            if gui ~= nil then pcall(function() gui:Destroy() end) end
+        end
+        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+        if playerGui ~= nil then
+            for _, name in ipairs({
+                "InfinityGoldToggle",
+                "InfinityGoldLoaderToggle",
+                "InfinityGoldEmergency",
+                "InfinityGoldStatus",
+            }) do
+                for _, child in ipairs(playerGui:GetChildren()) do
+                    if child.Name == name then
+                        pcall(function() child:Destroy() end)
+                    end
+                end
+            end
+        end
+        if sessionEnvironment ~= nil
+            and sessionEnvironment.__INFINITYGOLD_UNLOAD == unloadSession
+        then
+            sessionEnvironment.__INFINITYGOLD_UNLOAD = nil
+        end
+        pcall(function() Library:Destroy() end)
+    end
+    window.OnClose = unloadSession
+    if sessionEnvironment ~= nil then
+        sessionEnvironment.__INFINITYGOLD_UNLOAD = unloadSession
+    end
+
+    local function bindGroup(section)
+        return {
+            AddToggle = function(_, name, options)
+                options = options or {}
+                local element = section:AddToggle({
+                    Text = options.Text or name,
+                    Default = cfg[name] == true,
+                    Callback = function(value)
+                        cfg[name] = value
+                        if type(options.Callback) == "function" then
+                            options.Callback(value)
+                        end
+                    end,
+                })
+                return bind(name, element)
+            end,
+            AddDropdown = function(_, name, options)
+                options = options or {}
+                local element = section:AddDropdown({
+                    Text = options.Text or name,
+                    Values = options.Values or {},
+                    Default = options.Default,
+                    Multi = options.Multi,
+                    MaxVisible = options.MaxVisible,
+                    Callback = function(value) cfg[name] = value end,
+                })
+                return bind(name, element)
+            end,
+            AddSlider = function(_, name, options)
+                options = options or {}
+                local element = section:AddSlider({
+                    Text = options.Text or name,
+                    Default = options.Default or cfg[name],
+                    Min = options.Min or 0,
+                    Max = options.Max or 100,
+                    Rounding = options.Rounding or 0,
+                    Suffix = options.Suffix,
+                    Callback = function(value) cfg[name] = value end,
+                })
+                return bind(name, element)
+            end,
+            AddButton = function(_, options)
+                return section:AddButton(options)
+            end,
+            AddInput = function(_, name, options)
+                options = options or {}
+                local element
+                element = section:AddInput({
+                    Text = options.Text,
+                    Default = options.Default ~= nil and options.Default or cfg[name],
+                    Placeholder = options.Placeholder,
+                    Callback = function(value)
+                        local parsed = value
+                        if type(options.Parser) == "function" then
+                            local ok, result = pcall(options.Parser, value)
+                            if not ok or result == nil then
+                                if element ~= nil then element:Set(cfg[name]) end
+                                return
+                            end
+                            parsed = result
+                        end
+                        cfg[name] = parsed
+                        if type(options.Parser) == "function" and element ~= nil then
+                            element:Set(parsed)
+                        end
+                    end,
+                })
+                return bind(name, element)
+            end,
+            AddLabel = function(_, text)
+                return section:AddLabel(text)
+            end,
+        }
+    end
+
+    local function setRegisteredToggle(name, value)
+        cfg[name] = value == true
+        local element = registry[name]
+        if element ~= nil then
+            pcall(function() element:Set(value == true) end)
+        end
+    end
+
+    local function dropdownOptionValue(option)
+        if type(option) == "table" then
+            option = option.Value or option.value
+        end
+        if option == nil then return nil end
+        return tostring(option)
+    end
+
+    local function dropdownOptionText(option)
+        if type(option) == "table" then
+            local text = option.Text or option.text
+                or option.Label or option.label
+                or option.Value or option.value
+            if text == nil then return "" end
+            return tostring(text)
+        end
+        return tostring(option or "")
+    end
+
+    local function catalogLabelId(value)
+        local stableValue = dropdownOptionValue(value)
+        return tonumber(stableValue)
+            or tonumber(string.match(tostring(stableValue or ""), "^#?(%d+)"))
+    end
+
+    local function dropdownValuesFingerprint(values)
+        local parts = {}
+        for _, option in ipairs(values or {}) do
+            table.insert(parts, (dropdownOptionValue(option) or "")
+                .. "\31" .. dropdownOptionText(option))
+        end
+        return table.concat(parts, "\30")
+    end
+
+    local function sameArray(left, right)
+        if type(left) ~= "table" or #left ~= #right then return false end
+        for index, value in ipairs(right) do
+            if tostring(left[index]) ~= tostring(value) then return false end
+        end
+        return true
+    end
+
+    -- Config modules can appear after the hub UI. Keep every catalog-backed
+    -- dropdown live and preserve saved selections by stable numeric ID when a
+    -- translated label changes or the catalog arrives late.
+    local function refreshCatalogDropdown(
+        element,
+        configName,
+        initialValues,
+        valuesBuilder,
+        multi,
+        fallback,
+        captureOnce
+    )
+        task.spawn(function()
+            local fingerprint = dropdownValuesFingerprint(initialValues)
+            while sessionAlive do
+                task.wait(2)
+                local refreshed = valuesBuilder()
+                local minimumCount = fallback ~= nil and 1 or 0
+                if #refreshed > minimumCount then
+                    local refreshedFingerprint = dropdownValuesFingerprint(refreshed)
+                    local previous = cfg[configName]
+                    local desired
+
+                    if multi then
+                        local selectedIds = Common.parseIdSelection(previous)
+                        desired = {}
+                        for _, option in ipairs(refreshed) do
+                            local id = catalogLabelId(option)
+                            if id ~= nil and selectedIds[math.floor(id)] == true then
+                                table.insert(desired, dropdownOptionValue(option))
+                            end
+                        end
+                    else
+                        local previousText = tostring(previous or fallback or "")
+                        local previousId = catalogLabelId(previousText)
+                        desired = fallback
+                        for _, option in ipairs(refreshed) do
+                            local optionValue = dropdownOptionValue(option)
+                            if optionValue == previousText
+                                or dropdownOptionText(option) == previousText
+                                or (previousId ~= nil
+                                    and catalogLabelId(option) == previousId)
+                            then
+                                desired = optionValue
+                                break
+                            end
+                        end
+                    end
+
+                    local selectionChanged = multi
+                        and not sameArray(previous, desired)
+                        or (not multi and tostring(previous or "") ~= tostring(desired or ""))
+                    if refreshedFingerprint ~= fingerprint or selectionChanged then
+                        pcall(function()
+                            if refreshedFingerprint ~= fingerprint then
+                                element:SetValues(refreshed)
+                            end
+                            element:Set(desired)
+                        end)
+                        cfg[configName] = desired
+                        fingerprint = refreshedFingerprint
+                    end
+                    if captureOnce then break end
+                end
+            end
+        end)
+    end
+
+    -- Farm tab
+    do
+        local tab = window:CreateTab({ Name = "Farm", Icon = ">" })
+        local group = bindGroup(tab:CreateSection("Auto Farm"))
+        group:AddToggle("AutoFarm", {
+            Text = "Auto Farm",
+            Default = false,
+            Callback = function(value)
+                if value then
+                    setRegisteredToggle("AutoFarmSpecific", false)
+                    setRegisteredToggle("AutoTrain", false)
+                end
+            end,
+        })
+        group:AddToggle("AutoFarmSpecific", {
+            Text = "Farm specific stage only",
+            Default = false,
+            Callback = function(value)
+                if value then
+                    setRegisteredToggle("AutoFarm", false)
+                    setRegisteredToggle("AutoTrain", false)
+                end
+            end,
+        })
+        group:AddToggle("AutoWorldEvent", {
+            Text = "Auto World Event",
+            Default = false,
+        })
+        local worldEventDiagnostics = group:AddLabel("World Event: disabled")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    local state = cfg.AutoWorldEvent and worldEvent.status or "disabled"
+                    local eventId = worldEvent:CurrentId()
+                    local countdown = worldEvent:CountdownSeconds()
+                    local dragonTarget = worldEvent:FindTarget() ~= nil
+                    local specialEvent = worldEvent:HasSpecialEnemyEvent()
+                    local dragonWeather = worldEvent:DragonWeatherActive()
+                    local bossUi = worldEvent:DragonBossUiActive()
+                    local participant = worldEvent:ActiveParticipantPosition() ~= nil
+                    local openDoor = worldEvent:FindOpenDoor() ~= nil
+                    worldEventDiagnostics:Set(string.format(
+                        "World Event: %s • id %s • timer %s • config %s • notice %d • gate %s • boss %s • participant %s • dragon %s • special %s • combat %d",
+                        tostring(state),
+                        eventId and tostring(eventId) or "-",
+                        countdown ~= nil and tostring(countdown) or "-",
+                        dragonWeather and tostring(worldEvent.weatherName) or "no",
+                        worldEvent:InvitationValue(),
+                        openDoor and "open" or "closed",
+                        bossUi and "yes" or "no",
+                        participant and "yes" or "no",
+                        dragonTarget and "yes" or "no",
+                        specialEvent and "yes" or "no",
+                        worldEvent:CombatValue()
+                    ))
+                end)
+                task.wait(0.5)
+            end
+        end)
+        local stageValues = {}
+        for stage = 1, MAX_FARM_STAGE do
+            table.insert(stageValues, tostring(stage))
+        end
+        group:AddDropdown("FarmStage", {
+            Text = "Stage",
+            Values = stageValues,
+            Default = "1",
+            Multi = false,
+        })
+        group:AddDropdown("FarmMode", {
+            Text = "Mode",
+            Values = { "Ground", "Above", "Orbit", "Running", "Walking" },
+            Default = "Ground",
+            Multi = false,
+        })
+        group:AddSlider("FarmHeight", {
+            Text = "Height",
+            Default = 20, Min = 5, Max = 80, Rounding = 0,
+        })
+        group:AddSlider("OrbitRadius", {
+            Text = "Orbit radius",
+            Default = 25, Min = 5, Max = 80, Rounding = 0,
+        })
+        group:AddSlider("OrbitSpeed", {
+            Text = "Orbit speed",
+            Default = 1.5, Min = 0.2, Max = 6, Rounding = 1,
+        })
+        group:AddSlider("RunningDistance", {
+            Text = "Running distance from center",
+            Default = DEFAULT_RUNNING_DISTANCE,
+            Min = MIN_RUNNING_DISTANCE,
+            Max = MAX_RUNNING_DISTANCE,
+            Rounding = 0,
+        })
+        group:AddSlider("EnterDelay", {
+            Text = "Enter delay (s)",
+            Default = 0, Min = 0, Max = 30, Rounding = 1,
+        })
+        group:AddSlider("AttackRange", {
+            Text = "Attack range",
+            Default = 120, Min = 20, Max = 400, Rounding = 0,
+        })
+        group:AddToggle("AutoReturnFull", {
+            Text = "Auto return when bag full",
+            Default = true,
+        })
+        group:AddSlider("ReturnDelay", {
+            Text = "Return delay (s)",
+            Default = 0, Min = 0, Max = 30, Rounding = 0,
+        })
+        local returnDiagnostics = group:AddLabel("Bag check: waiting...")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    bagFull()
+                    local usedText = bagTelemetry.used ~= nil
+                        and tostring(math.floor(bagTelemetry.used)) or "?"
+                    local capacityText = bagTelemetry.capacity ~= nil
+                        and tostring(math.floor(bagTelemetry.capacity)) or "?"
+                    local state
+                    if not cfg.AutoReturnFull then
+                        state = "disabled"
+                    elseif returnEpisode.active then
+                        state = returnEpisode.fired
+                            and ("request sent x" .. tostring(returnEpisode.attempts)
+                                .. "; waiting for base")
+                            or "return pending"
+                    elseif bagTelemetry.known then
+                        state = bagTelemetry.full
+                            and "bag full; waiting for dungeon"
+                            or "armed"
+                    else
+                        state = "capacity unavailable"
+                    end
+                    if returnEpisode.lastError ~= nil then
+                        state = state .. "; " .. tostring(returnEpisode.lastError)
+                    end
+                    returnDiagnostics:Set(string.format(
+                        "Bag: %s / %s • %s\nAuto return: %s",
+                        usedText,
+                        capacityText,
+                        tostring(bagTelemetry.source),
+                        state
+                    ))
+                end)
+                task.wait(1)
+            end
+        end)
+
+    end
+
+    -- Combat tab
+    do
+        local tab = window:CreateTab({ Name = "Combat", Icon = "!" })
+        local group = bindGroup(tab:CreateSection("Automation"))
+        group:AddToggle("AutoAttack", { Text = "Auto Attack", Default = true })
+        group:AddToggle("AutoClick", { Text = "Auto Click", Default = false })
+        group:AddSlider("ClickRate", {
+            Text = "Click rate",
+            Default = 10, Min = 1, Max = 20, Rounding = 0,
+        })
+        group:AddButton({
+            Text = "Send test click now",
+            Callback = function()
+                local clicked, delivery = performAutoClick()
+                local message = clicked
+                    and ("test click sent via " .. tostring(delivery))
+                    or ("test click failed: " .. tostring(delivery))
+                notify(message)
+                banner(message)
+            end,
+        })
+        group:AddButton({
+            Text = "Probe skill modules",
+            Callback = function()
+                task.spawn(function()
+                    attack.skillInput = nil
+                    resolveAttack()
+                    local message = "skill: " .. tostring(attack.status)
+                    notify(message)
+                    banner(message)
+                end)
+            end,
+        })
+
+        local diagnostics = tab:CreateSection("Diagnostics"):AddLabel("probing...")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    local monsters = 0
+                    for _, folderName in ipairs({ "Monster", "LocalMonster" }) do
+                        local folder = workspace:FindFirstChild(folderName)
+                        if folder ~= nil then
+                            monsters = monsters + #folder:GetChildren()
+                        end
+                    end
+                    diagnostics:Set(string.format(
+                        "skill: %s\nclick delivery: %s\nnet: %s\n"
+                            .. "click remote: %s\nlast missed action: %s\n"
+                            .. "NowTargetCurrent: %s\nmonsters nearby containers: %d\n"
+                            .. "attacks: %d ok / %d fail\nclicks: %d ok / %d fail\n"
+                            .. "power requests: %d ok / %d fail / %s\n"
+                            .. "last attack error: %s\nlast click error: %s\n"
+                            .. "last power error: %s",
+                        tostring(attack.status),
+                        tostring(combatStats.clickDelivery),
+                        tostring(net.status),
+                        remoteFor("TRAIN_MANUAL_CLICK") ~= nil and "found" or "missing",
+                        tostring(net.lastMissedAction or "-"),
+                        player:FindFirstChild("NowTargetCurrent") ~= nil and "yes" or "no",
+                        monsters,
+                        combatStats.attacksOk, combatStats.attacksFailed,
+                        combatStats.clicksOk, combatStats.clicksFailed,
+                        combatStats.powerRequestsOk, combatStats.powerRequestsFailed,
+                        powerClick.inFlight and "pending" or "idle",
+                        tostring(combatStats.lastAttackError),
+                        tostring(combatStats.lastClickError),
+                        tostring(combatStats.lastPowerError)
+                    ))
+                end)
+                task.wait(1)
+            end
+        end)
+
+        tab:CreateSection("Notes"):AddParagraph({
+            Title = "How clicking works",
+            Text = "Auto Click continuously sends the confirmed power-click "
+                .. "request (one at a time) and releases the normal attack "
+                .. "skill, without moving the real mouse. Auto Attack "
+                .. "pauses while Walking or Running has not entered the "
+                .. "stage yet.",
+        })
+    end
+
+    -- Loot tab
+    do
+        local tab = window:CreateTab({ Name = "Loot", Icon = "#" })
+        local group = bindGroup(tab:CreateSection("Auto Pickup"))
+        group:AddToggle("AutoPickup", { Text = "Auto Pickup", Default = false })
+        group:AddSlider("PickupRange", {
+            Text = "Pickup range",
+            Default = 150, Min = 10, Max = 400, Rounding = 0,
+        })
+        group:AddLabel("Minimum gold value (no limit)")
+        group:AddInput("PickupMinValue", {
+            Default = 0,
+            Placeholder = "Type a whole number, for example 1000000000000",
+            Parser = parsePickupMinimumValue,
+        })
+        group:AddToggle("PickupFilterItems", {
+            Text = "Filter by items",
+            Default = false,
+        })
+        local pickupItemValues = catalogDropdownValues("materialConf", "Material")
+        local pickupItemsDropdown = group:AddDropdown("PickupItems", {
+            Text = "Items",
+            Values = pickupItemValues,
+            Default = {},
+            Multi = true,
+            MaxVisible = 5,
+        })
+        refreshCatalogDropdown(
+            pickupItemsDropdown,
+            "PickupItems",
+            pickupItemValues,
+            function() return catalogDropdownValues("materialConf", "Material") end,
+            true
+        )
+        tab:CreateSection("Notes"):AddParagraph({
+            Title = "Event drops",
+            Text = "Drops worth exactly 0 gold are treated as event drops: "
+                .. "they ignore the minimum value and item filter and are "
+                .. "collected first. Range and landing checks always apply.",
+        })
+
+        local sellSection = tab:CreateSection("Selling")
+        local sellGroup = bindGroup(sellSection)
+        sellGroup:AddToggle("AutoSell", {
+            Text = "Auto Sell (all)",
+            Default = false,
+            Callback = function(value)
+                if value then setRegisteredToggle("AutoSellSpecific", false) end
+            end,
+        })
+        sellGroup:AddToggle("AutoSellSpecific", {
+            Text = "Auto Sell Specific Items",
+            Default = false,
+            Callback = function(value)
+                if value then setRegisteredToggle("AutoSell", false) end
+            end,
+        })
+        local sellItemValues = catalogDropdownValues("materialConf", "Material")
+        local sellItemsDropdown = sellGroup:AddDropdown("SellItems", {
+            Text = "Items",
+            Values = sellItemValues,
+            Default = {},
+            Multi = true,
+        })
+        refreshCatalogDropdown(
+            sellItemsDropdown,
+            "SellItems",
+            sellItemValues,
+            function() return catalogDropdownValues("materialConf", "Material") end,
+            true
+        )
+        sellGroup:AddButton({
+            Text = "Sell All Now",
+            Callback = function()
+                local sold, count, err = sellAllMaterials(nil)
+                if sold then
+                    notify("Sell request sent for " .. tostring(count) .. " items")
+                else
+                    notify(err or "Nothing to sell")
+                end
+            end,
+        })
+        sellSection:AddParagraph({
+            Title = "Automatic order",
+            Text = "Base priority is Alchemy > Sell > Broom. Sell waits for a "
+                .. "confirmed/in-progress potion or a verified empty recipe scan. "
+                .. "Broom waits until a follow-up Sell scan finds nothing eligible. "
+                .. "Sell All Now remains a manual override.",
+        })
+
+        local stats = tab:CreateSection("Session"):AddLabel("drops: 0 • picked: 0")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    stats:Set(string.format(
+                        "drops nearby: %d • picked this session: %d\n"
+                            .. "auto sell: %s • requested items: %d",
+                        dropsNearby,
+                        pickupCount,
+                        sellTelemetry.status,
+                        sellTelemetry.requestedItems
+                    ))
+                end)
+                task.wait(1)
+            end
+        end)
+    end
+
+    -- Progress tab
+    do
+        local tab = window:CreateTab({ Name = "Progress", Icon = "%" })
+        local group = bindGroup(tab:CreateSection("Advancement"))
+        group:AddToggle("AutoRebirth", { Text = "Auto Rebirth", Default = false })
+        group:AddSlider("RebirthLimit", {
+            Text = "Stop at rebirths",
+            Default = 41, Min = 1, Max = 41, Rounding = 0,
+        })
+        group:AddToggle("AutoTrain", {
+            Text = "Auto Train",
+            Default = false,
+            Callback = function(value)
+                if value then
+                    setRegisteredToggle("AutoFarm", false)
+                    setRegisteredToggle("AutoFarmSpecific", false)
+                    setRegisteredToggle("AutoBroom", false)
+                end
+            end,
+        })
+        local trainGroundValues = catalogDropdownValues(
+            "trainConf",
+            "Training ground",
+            "Best available",
+            true
+        )
+        local trainGroundDropdown = group:AddDropdown("TrainGround", {
+            Text = "Training ground",
+            Values = trainGroundValues,
+            Default = "Best available",
+            Multi = false,
+        })
+        refreshCatalogDropdown(
+            trainGroundDropdown,
+            "TrainGround",
+            trainGroundValues,
+            function()
+                return catalogDropdownValues(
+                    "trainConf",
+                    "Training ground",
+                    "Best available",
+                    true
+                )
+            end,
+            false,
+            "Best available"
+        )
+
+        if loco ~= nil then
+            local broomGroup = bindGroup(tab:CreateSection("Broom"))
+            local ok = pcall(function() loco:Install(broomGroup) end)
+            if not ok then
+                broomGroup:AddLabel("Broom controls unavailable")
+            end
+        else
+            tab:CreateSection("Broom"):AddLabel("Walking/Broom module not loaded")
+        end
+    end
+
+    -- Alchemy tab
+    do
+        local tab = window:CreateTab({ Name = "Alchemy", Icon = "@" })
+        local group = bindGroup(tab:CreateSection("Automation"))
+        group:AddToggle("AutoBrew", { Text = "Auto Brew", Default = false })
+        local recipeValues = alchemyDropdownValues()
+        local recipeDropdown = group:AddDropdown("BrewRecipe", {
+            Text = "Recipe",
+            Values = recipeValues,
+            Default = "Best craftable",
+            Multi = false,
+        })
+        refreshCatalogDropdown(
+            recipeDropdown,
+            "BrewRecipe",
+            recipeValues,
+            alchemyDropdownValues,
+            false,
+            "Best craftable",
+            true
+        )
+        group:AddButton({
+            Text = "Copy Best diagnostic",
+            Callback = function()
+                local report = alchemyBestDiagnosticReport()
+                local copied = false
+                if type(setclipboard) == "function" then
+                    copied = pcall(setclipboard, report)
+                elseif type(toclipboard) == "function" then
+                    copied = pcall(toclipboard, report)
+                end
+                print(report)
+                notify(copied
+                    and "Best diagnostic copied to clipboard"
+                    or "Best diagnostic printed to console")
+            end,
+        })
+        group:AddToggle("AutoDrinkPotion", { Text = "Auto Drink Potion", Default = false })
+        local potionValues = catalogDropdownValues("potionConf", "Potion")
+        local potionDropdown = group:AddDropdown("DrinkPotions", {
+            Text = "Potions",
+            Values = potionValues,
+            Default = {},
+            Multi = true,
+        })
+        refreshCatalogDropdown(
+            potionDropdown,
+            "DrinkPotions",
+            potionValues,
+            function() return catalogDropdownValues("potionConf", "Potion") end,
+            true
+        )
+        group:AddToggle("AutoPickupPotion", { Text = "Auto Pickup Brewed Potion", Default = true })
+        local alchemyStatus = group:AddLabel("Alchemy: waiting...")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    local selected = alchemyTelemetry.selected
+                        and (" • " .. alchemyTelemetry.selected)
+                        or ""
+                    local lastError = alchemyTelemetry.lastError
+                        and (" • " .. tostring(alchemyTelemetry.lastError))
+                        or ""
+                    local function flag(value)
+                        if value == nil then return "?" end
+                        return value and "yes" or "no"
+                    end
+                    local chosen = alchemyTelemetry.chosenId ~= nil
+                        and ("#" .. tostring(alchemyTelemetry.chosenId))
+                        or "-"
+                    local remoteResult = alchemyTelemetry.remoteResult
+                    if remoteResult == nil then
+                        remoteResult = "-"
+                    elseif type(remoteResult) ~= "string"
+                        and type(remoteResult) ~= "number"
+                        and type(remoteResult) ~= "boolean"
+                    then
+                        remoteResult = type(remoteResult)
+                    end
+                    local temporaryUsed = alchemyTelemetry.temporaryBagUsed ~= nil
+                        and tostring(math.floor(alchemyTelemetry.temporaryBagUsed))
+                        or "?"
+                    alchemyStatus:Set(string.format(
+                        "Alchemy: %s • recipes: %d • craft: %d • pickup: %d%s%s\n"
+                            .. "Inventory: temporary %s • transfer %s\n"
+                            .. "Checks: use %s • brewing %s • ready %s • "
+                            .. "rebirth %d/%d • materials %d • craftable %d • "
+                            .. "direct %d • schema errors %d • errors %d • "
+                            .. "chosen %s • remote %s • travel %s • confirmed %s",
+                        alchemyTelemetry.status,
+                        alchemyTelemetry.recipes,
+                        alchemyTelemetry.craftAttempts,
+                        alchemyTelemetry.pickupAttempts,
+                        selected,
+                        lastError,
+                        temporaryUsed,
+                        tostring(alchemyTelemetry.transferStatus),
+                        flag(alchemyTelemetry.canUse),
+                        flag(alchemyTelemetry.inProgress),
+                        flag(alchemyTelemetry.ready),
+                        alchemyTelemetry.rebirthPassed,
+                        alchemyTelemetry.checkTotal,
+                        alchemyTelemetry.materialChecks,
+                        alchemyTelemetry.craftable,
+                        alchemyTelemetry.directCraftable,
+                        alchemyTelemetry.directSchemaErrors,
+                        alchemyTelemetry.predicateErrors,
+                        chosen,
+                        tostring(remoteResult),
+                        tostring(alchemyTelemetry.travel),
+                        flag(alchemyTelemetry.confirmed)
+                    ))
+                end)
+                task.wait(1)
+            end
+        end)
+        tab:CreateSection("Notes"):AddParagraph({
+            Title = "Automatic brewing",
+            Text = "Alchemy runs remotely only while the player is at base. "
+                .. "Dungeon drops first live in the small temporary bag. On return, "
+                .. "Best waits only until those materials appear in the permanent "
+                .. "999-slot Bag, aggregates duplicate material rows and compares "
+                .. "MID/NeedCount for all recipes locally. It sends one highest "
+                .. "available recipe in that first base cycle, never recipe IDs one by "
+                .. "one. A pickup refills the slot immediately when another Best is "
+                .. "available; otherwise it releases Sell, then Broom. Broom starts its "
+                .. "delay after Sell; Farm/Train and Enter Delay start only after Broom "
+                .. "enters the stage or is disabled. Craft and pickup "
+                .. "are remote-only and never move the character; only one potion can "
+                .. "brew at a time.",
+        })
+    end
+
+    -- Rewards tab
+    do
+        local tab = window:CreateTab({ Name = "Rewards", Icon = "*" })
+        local group = bindGroup(tab:CreateSection("Claims"))
+        group:AddToggle("AutoClaimIndex", { Text = "Auto Claim Index", Default = false })
+        group:AddToggle("AutoClaimOnline", { Text = "Auto Claim Online", Default = false })
+        group:AddToggle("AutoClaimEvent", { Text = "Auto Claim Event", Default = false })
+    end
+
+    -- Gear tab
+    do
+        local tab = window:CreateTab({ Name = "Gear", Icon = "+" })
+        local wand = bindGroup(tab:CreateSection("Wand"))
+        wand:AddToggle("AutoBuyWand", {
+            Text = "Auto Buy Best Affordable Wand",
+            Default = false,
+        })
+        wand:AddToggle("AutoEquipWand", {
+            Text = "Auto Equip Best Owned Wand",
+            Default = false,
+        })
+        if loco ~= nil then
+            local selectedBridge = {
+                [1] = function(configName, itemType)
+                    local entries = catalogByName(configName, itemType)
+                    local visible = {}
+                    for _, entry in ipairs(entries) do
+                        local name = translatedConfigName(entry.raw, entry.id, "Wand")
+                        name = Common.catalogDisplayName(name, "Wand", entry.id)
+                        table.insert(visible, {
+                            id = entry.id,
+                            price = entry.price,
+                            name = name,
+                        })
+                    end
+                    return visible
+                end,
+                [2] = function(id, itemType)
+                    local bag = playerBag()
+                    if type(bag) ~= "table" then return false end
+                    local owned = Common.ownedItemIds(bag, itemType)
+                    return owned[math.floor(tonumber(id) or 0)] == true
+                end,
+                [3] = function(kind)
+                    return playerNumber(kind)
+                end,
+                [4] = function(action, payload)
+                    return invokeAction(action, payload)
+                end,
+                [5] = {
+                    AutoEquipWand = {
+                        SetValue = function(_, value)
+                            setRegisteredToggle("AutoEquipWand", value == true)
+                        end,
+                    },
+                },
+            }
+            local selectedOk = pcall(function()
+                loco:Install(wand, "Wand", selectedBridge)
+            end)
+            if not selectedOk then
+                wand:AddLabel("Selected Wand controls unavailable")
+            end
+        end
+        local armor = bindGroup(tab:CreateSection("Armor"))
+        armor:AddToggle("AutoBuyArmor", {
+            Text = "Auto Buy Best Affordable Armor",
+            Default = false,
+        })
+        armor:AddToggle("AutoEquipArmor", {
+            Text = "Auto Equip Best Owned Armor",
+            Default = false,
+        })
+        tab:CreateSection("Notes"):AddParagraph({
+            Title = "Fail-open",
+            Text = "Gear automation reads the game's shop configs; if they "
+                .. "are unavailable nothing is bought.",
+        })
+    end
+
+    -- Info tab
+    do
+        local tab = window:CreateTab({ Name = "Info", Icon = "i" })
+        local group = bindGroup(tab:CreateSection("Session"))
+        group:AddToggle("AntiAfk", {
+            Text = "Anti AFK",
+            Default = true,
+            Callback = setAntiAfk,
+        })
+        local info = tab:CreateSection("Game"):AddLabel("loading...")
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    info:Set(string.format(
+                        "place: %d\njob: %s\nexecutor: %s\nuptime: %d s",
+                        game.PlaceId,
+                        tostring(game.JobId),
+                        executorName,
+                        math.floor(os.clock() - startedAt)
+                    ))
+                end)
+                task.wait(1)
+            end
+        end)
+
+        if DISCORD_INVITE ~= "" then
+            group:AddButton({
+                Text = "Copy invite",
+                Callback = function()
+                    if setclipboard then
+                        pcall(setclipboard, DISCORD_INVITE)
+                        notify("Invite copied")
+                    end
+                end,
+            })
+        end
+
+        group:AddButton({
+            Text = "Rejoin server",
+            Callback = function()
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId)
+                end)
+            end,
+        })
+
+        local configPath = BRAND .. "/config.json"
+        local fallbackConfigPath = BRAND .. "_config.json"
+
+        local function configPayload()
+            local payload = {}
+            for name in pairs(registry) do
+                payload[name] = cfg[name]
+            end
+            return payload
+        end
+
+        local function writeConfig(text)
+            if type(writefile) ~= "function" then
+                return false, "writefile unavailable"
+            end
+
+            local folderReady = false
+            if type(isfolder) == "function" then
+                local ok, exists = pcall(isfolder, BRAND)
+                folderReady = ok and exists == true
+            end
+            if not folderReady and type(makefolder) == "function" then
+                pcall(makefolder, BRAND)
+                if type(isfolder) == "function" then
+                    local ok, exists = pcall(isfolder, BRAND)
+                    folderReady = ok and exists == true
+                else
+                    folderReady = true
+                end
+            end
+
+            if folderReady then
+                local ok = pcall(writefile, configPath, text)
+                if ok then return true, configPath end
+            end
+            local ok, err = pcall(writefile, fallbackConfigPath, text)
+            if ok then return true, fallbackConfigPath end
+            return false, tostring(err)
+        end
+
+        local function readConfig()
+            if type(readfile) ~= "function" then
+                return nil, "readfile unavailable"
+            end
+            for _, path in ipairs({ configPath, fallbackConfigPath }) do
+                local ok, text = pcall(readfile, path)
+                if ok and type(text) == "string" and text ~= "" then
+                    return text, path
+                end
+            end
+            return nil, "no saved config"
+        end
+
+        local function saveConfig()
+            local ok, encoded = pcall(HttpService.JSONEncode, HttpService, configPayload())
+            if not ok then return false, tostring(encoded) end
+            return writeConfig(encoded)
+        end
+
+        local function loadConfig()
+            local text, source = readConfig()
+            if text == nil then return false, source end
+            local ok, decoded = pcall(HttpService.JSONDecode, HttpService, text)
+            if not ok or type(decoded) ~= "table" then
+                return false, "saved config is invalid"
+            end
+
+            -- Migrate the former combined Gear switches to Magic's separate
+            -- Wand/Armor controls without overriding an explicit new value.
+            if decoded.AutoBuyBest == true then
+                if decoded.AutoBuyWand == nil then decoded.AutoBuyWand = true end
+                if decoded.AutoBuyArmor == nil then decoded.AutoBuyArmor = true end
+            end
+            if decoded.AutoEquipBest == true then
+                if decoded.AutoEquipWand == nil then decoded.AutoEquipWand = true end
+                if decoded.AutoEquipArmor == nil then decoded.AutoEquipArmor = true end
+            end
+            if tonumber(decoded.RebirthLimit) ~= nil
+                and tonumber(decoded.RebirthLimit) < 1
+            then
+                decoded.RebirthLimit = 41
+            end
+
+            for name, element in pairs(registry) do
+                local value = decoded[name]
+                if value ~= nil then
+                    -- Set cfg synchronously: some UI controls dispatch their
+                    -- callbacks asynchronously, which made defaults win at boot.
+                    cfg[name] = value
+                    pcall(function() element:Set(value) end)
+                end
+            end
+            return true, source
+        end
+
+        local configGroup = bindGroup(tab:CreateSection("Config"))
+        configGroup:AddButton({
+            Text = "Save config",
+            Callback = function()
+                local ok, detail = saveConfig()
+                notify(ok and "Config saved" or ("Config save failed: " .. tostring(detail)))
+            end,
+        })
+        configGroup:AddButton({
+            Text = "Load config",
+            Callback = function()
+                configReady = false
+                local ok, detail = loadConfig()
+                configReady = true
+                if ok and loco ~= nil and type(loco.OnConfigLoaded) == "function" then
+                    pcall(function() loco:OnConfigLoaded() end)
+                end
+                notify(ok and "Config loaded" or ("Config load failed: " .. tostring(detail)))
+            end,
+        })
+
+        configGroup:AddButton({
+            Text = "Unload InfinityGold",
+            Callback = unloadSession,
+        })
+
+        -- Restore the saved values after every control has been registered.
+        -- Missing filesystem support or a first run remains intentionally quiet.
+        local loaded = loadConfig()
+        configReady = true
+        if loco ~= nil and type(loco.OnConfigLoaded) == "function" then
+            pcall(function() loco:OnConfigLoaded() end)
+        end
+        if loaded then notify("Config auto-loaded", 3) end
+    end
+
+    -- Main movement loop -----------------------------------------------------------------
+
+    -- Floating IG button: touch-friendly dashboard toggle in its own PlayerGui
+    -- ScreenGui (the channel proven to render on every executor). Mobile has
+    -- no Right Shift; this button always works and survives gui sweeps via
+    -- the watchdog below. It is draggable so the user can place it anywhere,
+    -- and the chosen position survives watchdog re-creation.
+    local floatingGui
+    -- Top-left anchored: AbsolutePosition reports the top-left corner, so
+    -- drag math and clamping must operate on the same reference point. A
+    -- bottom-right anchor makes the button jump by its own size on the
+    -- first drag move.
+    local floatingPosition = UDim2.new(1, -70, 1, -70)
+
+    local function ensureFloatingToggle()
+        pcall(function()
+            local playerGui = player:FindFirstChildOfClass("PlayerGui")
+            if playerGui == nil then return end
+            if floatingGui ~= nil and floatingGui.Parent ~= nil then return end
+
+            floatingGui = Instance.new("ScreenGui")
+            floatingGui.Name = "InfinityGoldToggle"
+            floatingGui.ResetOnSpawn = false
+            floatingGui.DisplayOrder = 999999
+            floatingGui.Parent = playerGui
+
+            local button = Instance.new("TextButton")
+            button.Name = "IG"
+            button.AnchorPoint = Vector2.new(0, 0)
+            button.Position = floatingPosition
+            button.Size = UDim2.new(0, 54, 0, 54)
+            button.BackgroundColor3 = Color3.fromRGB(245, 197, 66)
+            button.Font = Enum.Font.GothamBold
+            button.Text = "IG"
+            button.TextColor3 = Color3.fromRGB(13, 13, 18)
+            button.TextSize = 18
+            button.AutoButtonColor = true
+            button.Parent = floatingGui
+
+            local rounding = Instance.new("UICorner")
+            rounding.CornerRadius = UDim.new(1, 0)
+            rounding.Parent = button
+
+            local function toggleDashboard()
+                local frame = dashboard.window and dashboard.window.Frame
+                if frame == nil then return end
+                local host = frame.Parent
+                if host ~= nil and host.Parent == nil then
+                    local target = player:FindFirstChildOfClass("PlayerGui")
+                    if target ~= nil then host.Parent = target end
+                end
+                frame.Visible = not frame.Visible
+                banner(frame.Visible and "dashboard shown" or "dashboard hidden")
+            end
+
+            -- Tap toggles the dashboard; dragging moves the button. A short
+            -- travel threshold keeps accidental jitter from turning a tap
+            -- into a drag, and the position is clamped to the viewport.
+            local dragging = false
+            local dragMoved = false
+            local dragStart = nil
+            local buttonOrigin = nil
+
+            button.InputBegan:Connect(function(input)
+                if input.UserInputType == Enum.UserInputType.MouseButton1
+                    or input.UserInputType == Enum.UserInputType.Touch
+                then
+                    dragging = true
+                    dragMoved = false
+                    dragStart = input.Position
+                    buttonOrigin = button.AbsolutePosition
+                end
+            end)
+
+            UserInputService.InputChanged:Connect(function(input)
+                if not dragging then return end
+                if input.UserInputType ~= Enum.UserInputType.MouseMovement
+                    and input.UserInputType ~= Enum.UserInputType.Touch
+                then
+                    return
+                end
+                local delta = input.Position - dragStart
+                if not dragMoved and delta.Magnitude < 6 then
+                    return
+                end
+                dragMoved = true
+                local viewport = floatingGui.AbsoluteSize
+                local size = button.AbsoluteSize
+                local x = math.clamp(buttonOrigin.X + delta.X, 0, math.max(0, viewport.X - size.X))
+                local y = math.clamp(buttonOrigin.Y + delta.Y, 0, math.max(0, viewport.Y - size.Y))
+                button.Position = UDim2.new(0, x, 0, y)
+            end)
+
+            UserInputService.InputEnded:Connect(function(input)
+                if not dragging then return end
+                if input.UserInputType ~= Enum.UserInputType.MouseButton1
+                    and input.UserInputType ~= Enum.UserInputType.Touch
+                then
+                    return
+                end
+                dragging = false
+                if dragMoved then
+                    -- Keep the anchor-independent offset as the new position.
+                    floatingPosition = button.Position
+                else
+                    toggleDashboard()
+                end
+            end)
+        end)
+    end
+
+    ensureFloatingToggle()
+
+    -- Emergency panel: if the dashboard gui can never render (0x0), give the
+    -- user a minimal working control surface in the guaranteed channel.
+    local function buildEmergencyPanel(reason)
+        pcall(function()
+            local playerGui = player:FindFirstChildOfClass("PlayerGui")
+            if playerGui == nil or playerGui:FindFirstChild("InfinityGoldEmergency") then
+                return
+            end
+
+            local panel = Instance.new("ScreenGui")
+            panel.Name = "InfinityGoldEmergency"
+            panel.ResetOnSpawn = false
+            panel.DisplayOrder = 999998
+            panel.Parent = playerGui
+            emergencyGui = panel
+
+            local frame = Instance.new("Frame")
+            frame.AnchorPoint = Vector2.new(0, 1)
+            frame.Position = UDim2.new(0, 16, 1, -16)
+            frame.Size = UDim2.new(0, 230, 0, 170)
+            frame.BackgroundColor3 = Color3.fromRGB(13, 13, 18)
+            frame.Parent = panel
+
+            local frameCorner = Instance.new("UICorner")
+            frameCorner.CornerRadius = UDim.new(0, 10)
+            frameCorner.Parent = frame
+
+            local frameStroke = Instance.new("UIStroke")
+            frameStroke.Color = Color3.fromRGB(245, 197, 66)
+            frameStroke.Parent = frame
+
+            local title = Instance.new("TextLabel")
+            title.BackgroundTransparency = 1
+            title.Position = UDim2.new(0, 10, 0, 6)
+            title.Size = UDim2.new(1, -20, 0, 18)
+            title.Font = Enum.Font.GothamBold
+            title.Text = "InfinityGold (emergency)"
+            title.TextColor3 = Color3.fromRGB(245, 197, 66)
+            title.TextSize = 13
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            title.Parent = frame
+
+            local modeCycle = { "Ground", "Above", "Orbit", "Running", "Walking" }
+            local modeIndex = 1
+
+            local function addRow(offset, getText, onClick)
+                local row = Instance.new("TextButton")
+                row.Position = UDim2.new(0, 10, 0, offset)
+                row.Size = UDim2.new(1, -20, 0, 30)
+                row.BackgroundColor3 = Color3.fromRGB(28, 28, 38)
+                row.Font = Enum.Font.Gotham
+                row.TextSize = 13
+                row.TextColor3 = Color3.fromRGB(235, 233, 228)
+                row.AutoButtonColor = true
+                row.Text = getText()
+                row.Parent = frame
+                local rowCorner = Instance.new("UICorner")
+                rowCorner.CornerRadius = UDim.new(0, 6)
+                rowCorner.Parent = row
+                row.MouseButton1Click:Connect(function()
+                    onClick()
+                    row.Text = getText()
+                end)
+                return row
+            end
+
+            addRow(28, function()
+                return (cfg.AutoFarm and "[x] " or "[ ] ") .. "Auto Farm"
+            end, function()
+                cfg.AutoFarm = not cfg.AutoFarm
+            end)
+
+            addRow(62, function()
+                return "Mode: " .. tostring(cfg.FarmMode)
+            end, function()
+                modeIndex = modeIndex % #modeCycle + 1
+                cfg.FarmMode = modeCycle[modeIndex]
+            end)
+
+            addRow(96, function()
+                return (cfg.AutoPickup and "[x] " or "[ ] ") .. "Auto Pickup"
+            end, function()
+                cfg.AutoPickup = not cfg.AutoPickup
+            end)
+
+            local note = Instance.new("TextLabel")
+            note.BackgroundTransparency = 1
+            note.Position = UDim2.new(0, 10, 0, 130)
+            note.Size = UDim2.new(1, -20, 0, 34)
+            note.Font = Enum.Font.Gotham
+            note.Text = tostring(reason)
+            note.TextColor3 = Color3.fromRGB(154, 152, 146)
+            note.TextSize = 11
+            note.TextWrapped = true
+            note.TextXAlignment = Enum.TextXAlignment.Left
+            note.TextYAlignment = Enum.TextYAlignment.Top
+            note.Parent = frame
+        end)
+    end
+
+    -- Dashboard watchdog: some games sweep foreign ScreenGuis out of PlayerGui.
+    -- If ours is unparented, re-attach and say so on the banner; if it was
+    -- destroyed outright, keep the failure on screen instead of failing silently.
+    do
+        local wasAttached = true
+        task.spawn(function()
+            while sessionAlive do
+                pcall(function()
+                    ensureFloatingToggle()
+                    local attached = Library._gui ~= nil and Library._gui.Parent ~= nil
+                    if not attached then
+                        local playerGui = player:FindFirstChildOfClass("PlayerGui")
+                        if playerGui ~= nil and Library._gui ~= nil then
+                            Library._gui.Parent = playerGui
+                            attached = Library._gui.Parent ~= nil
+                            if attached then
+                                banner("dashboard gui was removed and re-attached")
+                            end
+                        end
+                    end
+                    if attached ~= wasAttached then
+                        wasAttached = attached
+                        if not attached then
+                            banner("dashboard gui could not be re-attached (destroyed?)")
+                        end
+                    end
+                end)
+                task.wait(2)
+            end
+        end)
+    end
+
+    task.spawn(function()
+        while sessionAlive do
+            local ok, err = pcall(updateMovement)
+            if not ok then
+                setMovementStatus("movement error: " .. tostring(err))
+            end
+            task.wait(cfg.FarmMode == "Orbit" and 0.05 or 0.25)
+        end
+    end)
+
+    setMovementStatus("ready")
+    notify("loaded • tap the gold IG button (bottom-right) to toggle the dashboard")
+
+    -- Dashboard render verification: measure the real engine layout instead
+    -- of guessing. One run must be enough to see (or fix) the problem:
+    --   * dead gui (AbsoluteSize 0x0) -> rebuilt; still dead -> emergency panel
+    --   * healthy gui -> IG probe badge proves the layer draws
+    --   * banner keeps the measurements on screen for 15 seconds
+        task.spawn(function()
+            task.wait(0.6)
+            if not sessionAlive then return end
+            banner("verifying dashboard render...")
+        local verifyOk, verifyError = pcall(function()
+            local windowGui = dashboard.window and dashboard.window.Gui
+            local mainFrame = dashboard.window and dashboard.window.Frame
+            if windowGui == nil or mainFrame == nil then
+                banner("dashboard missing after build (window or gui nil)")
+                return
+            end
+
+            local playerGui = player:FindFirstChildOfClass("PlayerGui")
+            if windowGui.Parent == nil and playerGui ~= nil then
+                windowGui.Parent = playerGui
+            end
+
+            local note = "ok"
+            if windowGui.AbsoluteSize.X < 10 or mainFrame.AbsoluteSize.X < 10 then
+                note = "rebuilt"
+                local fresh = Instance.new("ScreenGui")
+                fresh.Name = windowGui.Name
+                fresh.ResetOnSpawn = false
+                fresh.IgnoreGuiInset = true
+                fresh.DisplayOrder = 1000000
+                fresh.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+                fresh.Parent = playerGui
+                mainFrame.Parent = fresh
+                if Library._gui == windowGui then
+                    Library._gui = fresh
+                end
+                dashboard.window.Gui = fresh
+                task.wait(0.3)
+                windowGui = fresh
+            end
+
+            local stillDead = windowGui.AbsoluteSize.X < 10
+                or mainFrame.AbsoluteSize.X < 10
+            if stillDead then
+                buildEmergencyPanel(string.format(
+                    "dashboard gui stays at %dx%d px; emergency controls active",
+                    math.floor(mainFrame.AbsoluteSize.X),
+                    math.floor(mainFrame.AbsoluteSize.Y)
+                ))
+                banner("dashboard cannot render here - emergency panel bottom-left")
+                return
+            end
+
+            local badge = Instance.new("TextLabel")
+            badge.Name = "IGProbe"
+            badge.BackgroundColor3 = Color3.fromRGB(245, 197, 66)
+            badge.Size = UDim2.new(0, 44, 0, 24)
+            badge.Position = UDim2.new(0, 8, 0, 70)
+            badge.Text = "IG"
+            badge.TextColor3 = Color3.fromRGB(13, 13, 18)
+            badge.Font = Enum.Font.GothamBold
+            badge.TextSize = 14
+            badge.ZIndex = 50
+            badge.Parent = windowGui
+            task.delay(12, function()
+                pcall(function() badge:Destroy() end)
+            end)
+
+            banner(string.format(
+                "dashboard %s: %dx%d px in %s [%d children] • gold IG button toggles it",
+                note,
+                math.floor(mainFrame.AbsoluteSize.X),
+                math.floor(mainFrame.AbsoluteSize.Y),
+                tostring(windowGui.Parent and windowGui.Parent.ClassName or "?"),
+                #windowGui:GetChildren()
+            ))
+            task.delay(15, function()
+                if bannerGui ~= nil then
+                    pcall(function() bannerGui:Destroy() end)
+                    bannerGui = nil
+                end
+            end)
+        end)
+        if not verifyOk then
+            banner("verify error: " .. tostring(verifyError))
+        end
+    end)
+
+    return {
+        windowFrame = dashboard.window and dashboard.window.Frame or nil,
+        windowGui = dashboard.window and dashboard.window.Gui or nil,
+        floating = floatingGui,
+        unload = unloadSession,
+    }
+end
