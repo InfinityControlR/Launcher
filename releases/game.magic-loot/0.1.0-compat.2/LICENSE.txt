@@ -1,0 +1,8 @@
+Copyright (c) 2026 InfinityControlR. All rights reserved.
+
+This game payload is made publicly accessible solely for owner-operated
+development testing. No license is granted to use, copy, modify, redistribute,
+sublicense, or sell these payload files.
+
+The MIT license at the repository root applies only to loader.lua and does not
+apply to any file in this release directory.
