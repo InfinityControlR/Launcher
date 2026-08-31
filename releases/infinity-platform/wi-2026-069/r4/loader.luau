@@ -1225,14 +1225,14 @@ function KeyStore:Save(value: any): (boolean, string?)
 	if not self:IsPersistent() then
 		return false, self.failure or "FILESYSTEM_UNAVAILABLE"
 	end
-	
-	
+
+
 	if self.functions.makefolder ~= nil then
 		pcall(self.functions.makefolder, FOLDER)
 	end
-	
-	
-	
+
+
+
 	if self.functions.renamefile ~= nil then
 		self:_erasePath(TEMP_PATH)
 		local temporaryOk = pcall(self.functions.writefile, TEMP_PATH, key)
@@ -1840,7 +1840,7 @@ function Loader:_authorize(requestBytes: string, idempotencyKey: string)
 		fail(self.provider, "AUTHORIZATION_FAILED")
 	end
 	if response.kind == "ambiguous_transport" and retryCount == 1 then
-		
+
 		response = self.provider.authorize(requestBytes, idempotencyKey)
 		if self.state == "unloaded" or self.state == "unloading" then
 			fail(self.provider, "AUTHORIZATION_FAILED")
@@ -1909,11 +1909,11 @@ function Loader:_runCleanup()
 end
 
 function Loader:_load(requestBytes: string, idempotencyKey: string)
-	self:_checkCapabilities() 
+	self:_checkCapabilities()
 	local request = self.provider.validateAuthorizationRequest(requestBytes, idempotencyKey)
 	local response = self:_authorize(requestBytes, idempotencyKey)
 	local authorization = self.provider.validateAuthorizationResponse(response, request)
-	
+
 	if type(request) == "table" then
 		request.license_key = nil
 	end
@@ -1922,7 +1922,7 @@ function Loader:_load(requestBytes: string, idempotencyKey: string)
 	local manifest = self.provider.verifyManifest(authorization.manifest, request)
 	local grant = self.provider.verifyGrantAndExactScope(authorization.grant, manifest, request, authorization)
 	status(self.provider, "redeeming", "Descargando el adapter autorizado...")
-	
+
 	local delivery = self.provider.redeemExactlyOnce(grant, authorization.request_id)
 	if self.state == "unloaded" or self.state == "unloading" then
 		fail(self.provider, "AUTHORIZATION_FAILED")
@@ -1965,7 +1965,7 @@ function Loader:_load(requestBytes: string, idempotencyKey: string)
 	end
 	self.state = "running"
 	status(self.provider, "running", "Adapter cargado.")
-	
+
 	return self
 end
 
@@ -2099,8 +2099,8 @@ local function selectAdapterSource(distributionManifest: any, authorizedProductI
 	local selected: any = nil
 	for _, rawInput in ipairs(inputs) do
 		local input: any = rawInput
-		
-		
+
+
 		if type(input) == "table" and input.component == ADAPTER_SOURCE_COMPONENT then
 			if selected ~= nil then
 				fail("ADAPTER_MANIFEST_MISMATCH")
@@ -2143,7 +2143,7 @@ function AdapterRuntime:Compile(moduleId: string, source: string): any
 	if type(moduleId) ~= "string" or type(source) ~= "string" then
 		fail("ARTIFACT_COMPILE_FAILED")
 	end
-	
+
 	local wrapper = "return function(__infinity_require)\nlocal require = __infinity_require\n" .. source .. "\nend"
 	local chunk, _compileError = self.loadstring(wrapper, "@infinity-private/" .. moduleId)
 	wrapper = ""
